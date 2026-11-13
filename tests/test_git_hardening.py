@@ -9,7 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from harness import FactoryEnv, FactoryTestCase, git
+from harness import FactoryTestCase, git
+from harness import FactoryEnv
 
 SAFE = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
 

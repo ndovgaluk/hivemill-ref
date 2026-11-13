@@ -1095,6 +1095,18 @@ class WorktreeReuseSpawnTests(FactoryTestCase):
         self.assertEqual(git("symbolic-ref", "HEAD", cwd=P), "refs/heads/factory/t-0002")
         self.assertEqual(self.tw("T-0002"), str(P))
 
+    def test_claimed_row_with_missing_directory_is_dropped(self):
+        P = self.pooled()
+        self.claimed_for(P, 0)
+        self.assertEqual(self.mod_rm(P), 0)
+        self.spawn(2)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.tw("T-0002"), str(self.wts / "G-001-T-0002"))
+
+    def mod_rm(self, P):
+        git("worktree", "remove", "--force", str(P), cwd=self.repo)
+        return 0
+
     def test_reset_done_existing_worktree_path_unchanged(self):
         P = self.pooled()
         git("checkout", "-q", "-B", "factory/t-0002", "origin/main", cwd=P)

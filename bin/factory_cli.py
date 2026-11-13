@@ -9506,6 +9506,9 @@ def prepare_worktree(con, task, role):
         else:
             _pool_reuse_failed(con, repo, task, t["worktree"], step, err)
         t = dict(t, worktree=None)
+    if reuse_on and t["worktree"] and not Path(t["worktree"]).exists():
+        # a claim whose directory is gone can never be reused: drop the stale row, a fresh worktree follows
+        con.execute("DELETE FROM worktree_pool WHERE path=? AND task_id=? AND state='claimed'", (str(t["worktree"]), task))
     if t["worktree"] and Path(t["worktree"]).exists():
         if role == "coder" and t["branch"]:
             if not git_config_guard(con, t["worktree"]):

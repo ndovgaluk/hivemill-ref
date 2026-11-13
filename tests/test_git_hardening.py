@@ -560,13 +560,19 @@ class WorktreeOwnershipTests(FactoryTestCase):
         return why
 
     def assert_no_git_call_on(self, wt, lines):
+        # Whitelist: the shim logs the physical $PWD, so compare the logical and the resolved worktree
+        # path. On a refusal the only allowed call is `worktree list --porcelain` run in the repo.
         w = str(wt)
+        rw = os.path.realpath(w)
+        rr = os.path.realpath(self.repo)
         for line in lines:
             cwd, argv = line.split("\t", 1)
-            self.assertFalse(cwd == w or cwd.startswith(w + os.sep), line)
+            self.assertNotIn(cwd, {w, rw}, line)
+            self.assertFalse(cwd.startswith(w + os.sep) or cwd.startswith(rw + os.sep), line)
             self.assertNotIn(w, argv, line)
-            if cwd == str(self.repo):
-                self.assertIn("worktree list --porcelain", argv, line)
+            self.assertNotIn(rw, argv, line)
+            self.assertIn("worktree list --porcelain", argv, line)
+            self.assertIn(cwd, {str(self.repo), rr}, line)
 
     def admin(self, name="A"):
         return self.common / "worktrees" / name

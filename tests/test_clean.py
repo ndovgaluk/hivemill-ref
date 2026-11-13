@@ -808,6 +808,64 @@ class CleanPoolTests(CleanTests):
         self.assertFalse(wt.exists())
         self.assertEqual(self.rows(), [])
 
+    # T-0018 item 1: a trim-only run says so
+    def test_trim_only_summary_suffix(self):
+        self.cfg(pool_max="0")
+        for i in (1, 2):
+            self.pool_wt(f"pool-f{i}", released=f"2026-01-0{i}T00:00:00+00:00")
+        p = self.clean("--dry-run")
+        self.assertIn("total: 0 removed, 2 would remove, 0 skipped, 0 orphan(s), 0 sandbox dir(s) kept, 0 pooled, 2 trimmed [dry run]",
+                      p.stdout)
+        self.assertEqual(len(self.rows()), 2)
+        p = self.clean()
+        self.assertIn("total: 2 removed, 0 would remove, 0 skipped, 0 orphan(s), 0 sandbox dir(s) kept, 0 pooled, 2 trimmed\n", p.stdout + "\n")
+        self.assertTrue(p.stdout.rstrip().endswith("0 pooled, 2 trimmed"))
+        self.assertEqual(self.rows(), [])
+
+    # T-0018 item 2: a failed `git branch -D` puts the dir back on its task branch and does not pool it
+    def test_release_branch_delete_failure_restores_branch(self):
+        self.cfg()
+        wt, branch, _ = self.task()
+        common = Path(git("rev-parse", "--git-common-dir", cwd=self.repo))
+        common = common if common.is_absolute() else self.repo / common
+        lock = common / "refs" / "heads" / "factory" / "t-0001.lock"
+        lock.write_text("")
+        self.addCleanup(lambda: lock.unlink(missing_ok=True))
+        p = self.clean()
+        self.assertIn("branch delete failed:", p.stdout)
+        self.assertNotIn("released to pool", p.stdout)
+        self.assertEqual(git("symbolic-ref", "HEAD", cwd=wt), "refs/heads/factory/t-0001")
+        self.assertEqual(self.env.sql("SELECT worktree FROM tasks WHERE id='T-0001'")[0]["worktree"], str(wt))
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.events("worktree-pooled"), [])
+        self.assertTrue(wt.is_dir())
+        lock.unlink()
+        p = self.clean()
+        self.assertIn("released to pool", p.stdout)
+        self.assertEqual(self.branches(), "")
+        self.assertEqual([r["state"] for r in self.rows()], ["free"])
+
+    # T-0018 item 3a: the trim counts free rows only, even when claimed rows are the newest
+    def test_trim_counts_only_free_rows_when_claimed_are_newest(self):
+        self.cfg(pool_max="2")
+        f = [self.pool_wt(f"pool-f{i}", released=f"2026-01-0{i}T00:00:00+00:00") for i in (1, 2, 3)]
+        c = []
+        for i in (1, 2):
+            self.env.seed_task(f"T-009{i}", status="in_progress", pr_url=None)
+            wt = self.pool_wt(f"pool-c{i}", state="claimed", task=f"T-009{i}", released=f"2026-02-0{i}T00:00:00+00:00")
+            self.env.sql("UPDATE tasks SET worktree=? WHERE id=?", (str(wt), f"T-009{i}"))
+            c.append(wt)
+        before = [self.snap(w) for w in c]
+        p = self.clean()
+        self.assertEqual([r["path"] for r in self.rows() if r["state"] == "free"], [str(f[1]), str(f[2])])
+        self.assertFalse(f[0].exists())
+        self.assertTrue(f[1].exists() and f[2].exists())
+        self.assertEqual([r["task_id"] for r in self.rows() if r["state"] == "claimed"], ["T-0091", "T-0092"])
+        self.assertTrue(all(w.exists() for w in c))
+        self.assertEqual([self.snap(w) for w in c], before)
+        self.assertEqual(p.stdout.count("pool over cap"), 1)
+        self.assertNotIn("claimed meanwhile", p.stdout)
+
 
 # CleanPoolTests reuses CleanTests' fixtures only: hide the inherited test_* methods (the loader skips non-callables)
 class WorktreeReuseLifecycleTests(FactoryTestCase):

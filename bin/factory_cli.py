@@ -8903,9 +8903,10 @@ def git_run(repo, *args, env=None, text=True, **kw):
 
 # ── worktree pool (G-002): DB claim model + the one ownership check every pooled-worktree git call goes through ──
 
-def pool_claim(con, project_id, task_id):
+def pool_claim(con, project_id, task_id, branch=None):
     """Claim the oldest free pooled worktree of `project_id` for `task_id`; its path, or None when none is free.
     One BEGIN IMMEDIATE transaction (SQLite has one writer), UPDATE guarded by state='free', rowcount must be 1.
+    With `branch`, the task's worktree/branch columns are set in the same transaction (a crash leaves neither).
     DB only: no git, no filesystem."""
     con.execute("BEGIN IMMEDIATE")
     try:
@@ -8918,6 +8919,8 @@ def pool_claim(con, project_id, task_id):
                           "WHERE path=? AND state='free'", (task_id, now(), row[0]))
         if cur.rowcount != 1:
             raise RuntimeError(f"worktree_pool claim of {row[0]} lost a race (rowcount {cur.rowcount})")
+        if branch is not None:
+            con.execute("UPDATE tasks SET worktree=?, branch=? WHERE id=?", (row[0], branch, task_id))
         con.execute("COMMIT")
         return row[0]
     except BaseException:
@@ -9345,8 +9348,20 @@ def _pool_state_paths(admin):
     return [os.path.join(admin, n) for n in names if os.path.lexists(os.path.join(admin, n))]
 
 
+def _pool_unlink_ref_links(admin):
+    """Before any git call: unlink (never follow) a symlinked refs/ or a symlinked or non-directory per-worktree ref dir."""
+    refs = os.path.join(admin, "refs")
+    if os.path.islink(refs):
+        os.unlink(refs)
+    for r in _POOL_STATE_REFS:
+        p = os.path.join(admin, r)
+        if os.path.islink(p) or (os.path.lexists(p) and not os.path.isdir(p)):
+            os.unlink(p)
+
+
 def _pool_sweep(repo, wt, admin):
     """Delete the previous task's per-worktree git state (step 2). Raises OSError; returns (rc, err) of the ref cleanup."""
+    _pool_unlink_ref_links(admin)
     for p in _pool_state_paths(admin):
         if os.path.isdir(p) and not os.path.islink(p):
             shutil.rmtree(p)
@@ -9404,6 +9419,9 @@ def _pool_reset(con, repo, wt, branch, start):
         return False, "verify", f"per-worktree refs left: {(out or err)[:200]}"
     try:
         left = _pool_state_paths(admin)
+        if os.path.islink(os.path.join(admin, "refs")):
+            left.append(os.path.join(admin, "refs"))
+        left += [os.path.join(admin, r) for r in _POOL_STATE_REFS if os.path.lexists(os.path.join(admin, r))]
     except OSError as e:
         return False, "verify", str(e)
     if left:
@@ -9453,10 +9471,9 @@ def _pool_claim_for_spawn(con, repo, project_id, task, branch, start):
     each pool row once: a row failing the ownership check is dropped (dir kept) and the next is tried; a reset
     failure falls back to a fresh worktree at once."""
     for _ in range(con.execute("SELECT count(*) FROM worktree_pool WHERE project_id=?", (project_id,)).fetchone()[0] + 1):
-        path = pool_claim(con, project_id, task)
+        path = pool_claim(con, project_id, task, branch)
         if path is None:
             return None
-        con.execute("UPDATE tasks SET worktree=?, branch=? WHERE id=?", (path, branch, task))
         ok, step, err = _pool_reset(con, repo, path, branch, start)
         if not ok and step == "ownership":
             _pool_mismatch(con, task, path, err)
@@ -12716,8 +12733,12 @@ def _clean_pool_release(con, repo, base, t, wt, project_id, cap, has_branch, dry
         return None
     if has_branch:
         r = _git(repo, "branch", "-D", t["branch"])
-        if r.returncode != 0:
-            return "skip", "branch delete failed: " + r.stderr.strip()[:80]
+        if r.returncode != 0:  # fail closed: put the dir back on its task branch, never pool it while the branch lives
+            msg = r.stderr.strip()
+            rc, _, err = _wt_git(repo, wt, "checkout", "-q", t["branch"])
+            if rc != 0:
+                return "skip", "branch delete failed, re-attach failed: " + err[:60]
+            return "skip", "branch delete failed: " + msg[:80]
     con.execute("UPDATE tasks SET worktree=NULL WHERE id=?", (t["id"],))
     pool_free(con, str(wt), project_id)
     event(con, "task", t["id"], "worktree-pooled", {"path": str(wt), "task": t["id"], "project": project_id})
@@ -12955,9 +12976,11 @@ def cmd_clean(a):
     rows += [{"task": "-", "worktree": str(d), "branch": "", "action": "skip", "reason": "orphan (left alone)"} for d in orphans]
     table(rows, ["task", "worktree", "branch", "action", "reason"])
     n = lambda act: sum(1 for r in rows if r["action"] == act and r["reason"] != "orphan (left alone)")
+    trimmed = sum(1 for r in rows if r["reason"] == "pool over cap" and r["action"] in ("removed", "would remove"))
     print(f"total: {n('removed')} removed, {n('would remove')} would remove, "
           f"{n('skip')} skipped, {len(orphans)} orphan(s), {sandbox_kept} sandbox dir(s) kept"
-          + (f", {n('pooled') + n('would pool')} pooled" if n('pooled') + n('would pool') else "")
+          + (f", {n('pooled') + n('would pool')} pooled" if n('pooled') + n('would pool') or trimmed else "")
+          + (f", {trimmed} trimmed" if trimmed else "")
           + (" [dry run]" if a.dry_run else ""))
 
 

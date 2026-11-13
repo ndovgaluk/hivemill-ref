@@ -1088,6 +1088,97 @@ class WorktreeReuseSpawnTests(FactoryTestCase):
         self.assertTrue(seen[0] is None or seen[0].startswith("locked"), f"second claimer got {seen[0]!r}")
         self.assertEqual([(r["task_id"], r["state"]) for r in self.rows()], [("T-0002", "claimed")])
 
+    # T-0018 item 3b: the claim SELECT skips a claimed row even when it is the oldest
+    def test_claim_skips_older_claimed_row(self):
+        old = self.pooled(1, node_modules=False)
+        new = self.pooled(4, node_modules=False)
+        self.env.seed_task("T-0005", status="in_progress", pr_url=None)
+        self.env.sql("UPDATE worktree_pool SET state='claimed', task_id='T-0005', claimed_at='t', released_at='2026-01-01T00:00:00+00:00' WHERE path=?", (str(old),))
+        self.env.sql("UPDATE worktree_pool SET released_at='2026-02-01T00:00:00+00:00' WHERE path=?", (str(new),))
+        self.env.sql("UPDATE tasks SET worktree=? WHERE id='T-0005'", (str(old),))
+        self.todo(2)
+        self.spawn(2)
+        self.assertEqual(self.tw("T-0002"), str(new))
+        self.assertEqual(len(self.events("worktree-reused")), 1)
+        self.assertEqual([(r["path"], r["state"], r["task_id"]) for r in self.rows()],
+                         sorted([(str(old), "claimed", "T-0005"), (str(new), "claimed", "T-0002")]))
+        self.assertEqual(self.tw("T-0005"), str(old))
+
+    # T-0018 item 4: claim and the task's worktree column are one transaction
+    def test_crash_between_claim_and_task_update_leaves_no_orphan(self):
+        P = self.pooled()
+        self.todo(2)
+        cm = self.env.load_factory()
+        mod = cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+        con = mod.db()
+
+        class Crash:
+            def __init__(self, con):
+                self.con = con
+
+            def execute(self, sql, *a):
+                if sql.startswith("UPDATE tasks SET worktree"):
+                    raise KeyboardInterrupt("simulated crash")
+                return self.con.execute(sql, *a)
+
+        with self.assertRaises(KeyboardInterrupt):
+            mod._pool_claim_for_spawn(Crash(con), str(self.repo), "zz-test-proj", "T-0002", "factory/t-0002", "origin/main")
+        self.assertEqual(self.env.sql("SELECT count(*) c FROM worktree_pool WHERE state='claimed'")[0]["c"], 0)
+        self.assertEqual([(r["path"], r["state"], r["task_id"]) for r in self.rows()], [(str(P), "free", None)])
+        self.assertIsNone(self.tw("T-0002"))
+
+    # T-0018 item 5: symlinked per-worktree ref dirs are unlinked, never followed
+    def test_symlinked_ref_dirs_are_unlinked_not_followed(self):
+        for pooled_n, tid, name in ((1, 2, "refs/worktree"), (4, 3, "refs/bisect"), (5, 6, "refs/rewritten"), (7, 8, "refs")):
+            with self.subTest(name=name):
+                P = self.pooled(pooled_n, node_modules=False)
+                adm = self.admin(P)
+                canary = self.env.home / f"canary-{name.replace('/', '-')}"
+                (canary / "x").mkdir(parents=True)
+                sha = git("rev-parse", "HEAD", cwd=P)
+                (canary / "x" / "ref").write_text(sha + "\n")
+                (canary / "marker").write_text("keep\n")
+                before = {f: f.read_bytes() for f in (canary / "x" / "ref", canary / "marker")}
+                link = adm / name
+                if link.is_dir() and not link.is_symlink():
+                    shutil.rmtree(link)
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(canary)
+                self.todo(tid)
+                self.spawn(tid)
+                self.assertEqual({f: f.read_bytes() for f in before}, before)
+                self.assertTrue(canary.is_dir())
+                self.assertFalse(link.is_symlink())
+                if name != "refs":
+                    self.assertFalse(os.path.lexists(link))
+                self.assertEqual(self.tw(f"T-000{tid}"), str(P))
+                self.assertEqual(git("symbolic-ref", "HEAD", cwd=P), f"refs/heads/factory/t-000{tid}")
+                self.assertEqual(len([e for e in self.events("worktree-reused") if f"T-000{tid}" in e["detail"]]), 1)
+
+    def test_verify_refuses_a_symlinked_ref_dir_the_sweep_left(self):
+        P = self.pooled(1, node_modules=False)
+        adm = self.admin(P)
+        canary = self.env.home / "canary-verify"
+        canary.mkdir()
+        cm = self.env.load_factory()
+        mod = cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+        real = mod._pool_sweep
+
+        def leaving_a_link(repo, wt, admin):  # the real sweep, then a symlink it "missed"
+            rc = real(repo, wt, admin)
+            (Path(admin) / "refs").mkdir(exist_ok=True)
+            if not os.path.lexists(Path(admin) / "refs" / "bisect"):
+                (Path(admin) / "refs" / "bisect").symlink_to(canary)
+            return rc
+
+        with mock.patch.object(mod, "_pool_sweep", leaving_a_link):
+            ok, step, err = mod._pool_reset(mod.db(), str(self.repo), str(P), "factory/t-0002", "origin/main")
+        self.assertEqual((ok, step), (False, "verify"))
+        self.assertIn("bisect", err)
+        self.assertEqual(list(canary.iterdir()), [])
+
     # 9 crash recovery
     def claimed_for(self, P, reset_ok):
         self.todo(2)

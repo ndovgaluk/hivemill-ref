@@ -13,7 +13,7 @@ Enable it with `factory config worktree_reuse 1`; disable with `factory config w
 
 ## Lifecycle
 
-1. **Clean releases.** `factory clean` finds a merged, pushed, clean worktree whose agent is gone. With reuse on it does not delete the directory: it detaches HEAD at `origin/<base>`, deletes the task branch, clears `tasks.worktree` and records a `free` row in `worktree_pool` (action `pooled`). Every safety refusal of clean (dirty, untracked files, unpushed commits, open PR, live agent, live pane) still applies. After pooling, clean trims the free rows of each project to `worktree_pool_max`, oldest release first (action `removed`, reason `pool over cap`). A `claimed` row is never removed or trimmed.
+1. **Clean releases.** `factory clean` finds a merged, pushed, clean worktree whose agent is gone. With reuse on it does not delete the directory: it detaches HEAD at `origin/<base>`, deletes the task branch, clears `tasks.worktree` and records a `free` row in `worktree_pool` (action `pooled`). Every safety refusal of clean (dirty, untracked files, unpushed commits, open PR, live agent, live pane, `kept: has config.worktree`, `git config refused`) still applies; see [Poisoned pooled worktree](#poisoned-pooled-worktree). After pooling, clean trims the free rows of each project to `worktree_pool_max`, oldest release first (action `removed`, reason `pool over cap`). A `claimed` row is never removed or trimmed.
 
 
 Reset also unlinks (never follows) a symlinked `refs/` or `refs/worktree`, `refs/bisect`, `refs/rewritten` in the worktree admin dir before any git call, and its verification fails if one is left. The claim and the `tasks.worktree`/`branch` update happen in one transaction.
@@ -27,7 +27,7 @@ A failed `git branch -D` on release fails closed: clean checks the task branch o
 
 ## Fallback and events
 
-Any failure while claiming or resetting (ownership mismatch, git error, config guard refusal, no free row) falls back to a fresh worktree, so a task is never blocked by the pool. Events:
+Any failure while claiming or resetting the pooled directory (ownership mismatch, git error, the pooled directory's own config guard refusal, no free row) falls back to a fresh worktree, so a task is never blocked by the pool. A forbidden `config.worktree` in ANY worktree's admin dir of the repo is different: it trips the repo-level guard first and `factory spawn` exits 4 (see [Poisoned pooled worktree](#poisoned-pooled-worktree)). Events:
 
 | event | when |
 |---|---|
@@ -36,6 +36,13 @@ Any failure while claiming or resetting (ownership mismatch, git error, config g
 | `worktree-reuse-failed` | a claim or reset failed; spawn fell back to a fresh worktree (`step`, `error`) |
 | `worktree-pool-trimmed` | clean removed a free row above `worktree_pool_max` |
 | `worktree-gitdir-mismatch` | a worktree's `.git` did not point at its own admin directory (forged or symlinked); it is left alone and the director is told |
+
+## Poisoned pooled worktree
+
+1. The git config guard reads the `config.worktree` of every worktree of the repo. ONE worktree whose admin dir holds a forbidden key (for example `core.fsmonitor`) makes every `factory spawn` of that repo exit 4, pooled or not, and also with `worktree_reuse=0`.
+2. `factory clean` never pools a dir whose admin dir has a `config.worktree` (action `skip`, reason `kept: has config.worktree`; a stale claim stays claimed). With a forbidden key it reports `git config refused` as before. Clean keeps the dir and reports it on every run until the file is gone.
+3. The spawn error names the pooled path, its state and the file: `spawn refused: git config in <repo> would run code: <keys>; pooled worktree <path> (free) has <repo>/.git/worktrees/<name>/config.worktree: move that file out of the repository ...`. Finding it uses filesystem reads only; no git command runs after the refusal.
+4. Recovery: inspect the file, then move it out of the repository (keep it to find out who wrote it), e.g. `mv <repo>/.git/worktrees/<name>/config.worktree /home/user/quarantine/`, and run the spawn again. The next claim resets the dir as usual.
 
 ## The `worktree_pool` table
 
@@ -53,4 +60,4 @@ Ownership of a pooled directory is checked (symlink- and forged-`.git`-safe) bef
 
 ## Tests
 
-`tests/test_clean.py` (`WorktreeReuseLifecycleTests`, the whole cycle through the CLI), `CleanPoolTests`, and `tests/test_git_hardening.py` (`WorktreeReuseSpawnTests`).
+`tests/test_clean.py` (`WorktreeReuseLifecycleTests`, the whole cycle through the CLI, including `test_poisoned_pooled_worktree_spawn_message` and `test_poisoned_unpooled_worktree_message_unchanged`), `CleanPoolTests` (including `test_forbidden_config_worktree_not_pooled`, `test_config_worktree_with_allowed_keys_not_pooled`, `test_stale_claim_with_config_worktree_stays_claimed`), and `tests/test_git_hardening.py` (`WorktreeReuseSpawnTests`).

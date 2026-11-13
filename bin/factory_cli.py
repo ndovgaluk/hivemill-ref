@@ -9032,8 +9032,7 @@ def _wt_git(repo, wt, *args, timeout=60, env=None):
     if admin is None:
         return 126, "", f"refused: {wt} is not a worktree of {repo}: {why}"
     w = os.path.abspath(str(wt))
-    argv = ["git", *[x for k, v in git_overrides() for x in ("-c", f"{k}={v}")],
-            f"--git-dir={admin}", f"--work-tree={w}", *HARDENED_GIT_FLAGS, *args]
+    argv = git_argv(repo, f"--git-dir={admin}", f"--work-tree={w}", *HARDENED_GIT_FLAGS, *args)
     _PT["git_n"] += 1
     try:
         r = subprocess.run(argv, cwd=w, capture_output=True, text=True, timeout=timeout,

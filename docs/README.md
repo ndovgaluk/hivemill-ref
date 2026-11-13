@@ -106,6 +106,7 @@ Every page under `docs/`, grouped by what you want to do. New to the factory? St
 - [worker-guard.md](worker-guard.md): the hook that blocks bypasses of prefix-matched deny rules.
 - [worker-sandbox.md](worker-sandbox.md): the sandbox around workers: design, owner steps, rollout per role, rollback, residual risk.
 - [git-hardening.md](git-hardening.md): how `bin/factory` defuses malicious settings in shared git config.
+- [worktree-reuse.md](worktree-reuse.md): opt-in `worktree_reuse`: `factory clean` pools merged coder worktrees and `factory spawn` reuses them.
 - [settings-templates.md](settings-templates.md): per-role settings that need absolute paths.
 - [per-role-plugins.md](per-role-plugins.md): each role loads only its own skills.
 - [context-policy.md](context-policy.md): keeping persistent sessions' context from growing unbounded.

@@ -571,8 +571,11 @@ class WorktreeOwnershipTests(FactoryTestCase):
             self.assertFalse(cwd.startswith(w + os.sep) or cwd.startswith(rw + os.sep), line)
             self.assertNotIn(w, argv, line)
             self.assertNotIn(rw, argv, line)
-            self.assertIn("worktree list --porcelain", argv, line)
-            self.assertIn(cwd, {str(self.repo), rr}, line)
+            # the only allowed call: git -C <repo> ... worktree list --porcelain (its $PWD is the caller's, not the repo's)
+            toks = argv.split()
+            self.assertEqual(toks[0], "-C", line)
+            self.assertIn(toks[1], {str(self.repo), rr}, line)
+            self.assertTrue(argv.endswith(" worktree list --porcelain"), line)
 
     def admin(self, name="A"):
         return self.common / "worktrees" / name
@@ -709,6 +712,16 @@ class WorktreeOwnershipTests(FactoryTestCase):
         (self.admin("H") / "gitdir").write_text(f"{h}/.git\n")
         (self.admin("H") / "commondir").write_text("../..\n")
         self.shim_git()
+        # positive control: the helper is not vacuous (accepts the one allowed call, rejects each bad shape)
+        ok = f"/cwd\t-C {self.repo} -c core.hooksPath=/dev/null worktree list --porcelain"
+        self.assert_no_git_call_on(self.wts / "L", [ok])
+        for bad in (f"{self.S}\t-C {self.repo} worktree list --porcelain",
+                    f"{os.path.realpath(self.S)}/sub\t-C {self.repo} worktree list --porcelain",
+                    f"/cwd\t-C {self.repo} status",
+                    f"/cwd\t-C {os.path.realpath(self.S)} worktree list --porcelain",
+                    f"/cwd\t-C {self.repo} rev-parse HEAD"):
+            with self.assertRaises(AssertionError, msg=bad):
+                self.assert_no_git_call_on(self.wts / "L", [bad])
         for wt in (self.wts / "L", c, x, h):
             start = len(self.calls())
             self.mod._wt_git(self.repo, wt, "status")

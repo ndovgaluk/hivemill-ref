@@ -111,6 +111,11 @@ CREATE TABLE retro_reports (
   fixes TEXT NOT NULL,
   author TEXT NOT NULL,
   created TEXT NOT NULL);
+CREATE TABLE worktree_pool (
+  path TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('free','claimed')),
+  task_id TEXT, reset_ok INTEGER NOT NULL DEFAULT 0, claimed_at TEXT, released_at TEXT NOT NULL,
+  CHECK((state='free' AND task_id IS NULL) OR (state='claimed' AND task_id IS NOT NULL)));
 CREATE TABLE scout_candidates (
   id TEXT PRIMARY KEY,            -- C-0001
   key TEXT NOT NULL UNIQUE,       -- 'gh:<owner>/<repo>[/<path>]' or 'mkt:<marketplace>/<plugin>'
@@ -231,6 +236,8 @@ INSERT INTO "config"("key","value") VALUES('serve_bind','');
 INSERT INTO "config"("key","value") VALUES('serve_port','8765');
 INSERT INTO "config"("key","value") VALUES('serve_hostnames','');
 INSERT INTO "config"("key","value") VALUES('task_clones','0');
+INSERT INTO "config"("key","value") VALUES('worktree_reuse','0');
+INSERT INTO "config"("key","value") VALUES('worktree_pool_max','2');
 INSERT INTO "config"("key","value") VALUES('factory_remote_url','');
 INSERT INTO "config"("key","value") VALUES('opus_effort','medium');
 INSERT INTO "config"("key","value") VALUES('judge_max_refreshes','4');
@@ -272,3 +279,5 @@ CREATE INDEX idx_gate_runs_head ON gate_runs(project_id, head_sha);
 CREATE INDEX idx_lesson_links ON lesson_links(lesson_id);
 CREATE INDEX idx_rejection_incidents_cause ON rejection_incidents(cause);
 CREATE INDEX idx_rejection_incidents_task ON rejection_incidents(task_id);
+CREATE UNIQUE INDEX worktree_pool_task ON worktree_pool(task_id) WHERE state='claimed';
+CREATE INDEX worktree_pool_proj ON worktree_pool(project_id, state, released_at);

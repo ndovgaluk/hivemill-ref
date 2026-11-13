@@ -71,5 +71,46 @@ class ConfigCheck(FactoryTestCase):
             self.assertIn("usage:", r.stderr)
 
 
+class WorktreeReuseConfig(FactoryTestCase):
+    """G-002: worktree_reuse (0|1) and worktree_pool_max (0..50) through the real `factory config` entry point."""
+
+    def setUp(self):
+        super().setUp()
+        self.env.seed_agent("claude-director", "director")
+        con = sqlite3.connect(self.env.db_path)
+        con.execute("DELETE FROM config")
+        con.commit()
+        con.close()
+
+    def test_defaults(self):
+        self.assertEqual(self.ok("config", "worktree_reuse").stdout.strip(), "0")
+        self.assertEqual(self.ok("config", "worktree_pool_max").stdout.strip(), "2")
+
+    def test_reuse_accepts_0_and_1_only(self):
+        self.ok("config", "worktree_reuse", "1", agent="claude-director")
+        self.assertEqual(self.ok("config", "worktree_reuse").stdout.strip(), "1")
+        r = self.refused(2, "config", "worktree_reuse", "2", agent="claude-director")
+        self.assertIn("worktree_reuse must be 0 or 1, not '2'", r.stderr)
+        self.assertEqual(self.ok("config", "worktree_reuse").stdout.strip(), "1")  # the bad value was not stored
+
+    def test_pool_max_range(self):
+        for good in ("0", "50", "7"):
+            self.ok("config", "worktree_pool_max", good, agent="claude-director")
+            self.assertEqual(self.ok("config", "worktree_pool_max").stdout.strip(), good)
+        for bad in ("51", "-1", "x", "", "1.5"):
+            r = self.refused(2, "config", "worktree_pool_max", bad, agent="claude-director")
+            self.assertIn(f"worktree_pool_max must be an integer 0..50, not {bad!r}", r.stderr)
+        self.assertEqual(self.ok("config", "worktree_pool_max").stdout.strip(), "7")
+
+    def test_check_reports_stored_bad_values(self):
+        con = sqlite3.connect(self.env.db_path)
+        con.execute("INSERT INTO config(key,value) VALUES('worktree_reuse','2'),('worktree_pool_max','51')")
+        con.commit()
+        con.close()
+        r = self.refused(2, "config", "--check")
+        self.assertIn("worktree_reuse: worktree_reuse must be 0 or 1, not '2'", r.stdout)
+        self.assertIn("worktree_pool_max: worktree_pool_max must be an integer 0..50, not '51'", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

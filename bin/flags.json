@@ -973,6 +973,23 @@
    "goal": "G-010",
    "doc": "",
    "state": "off"
+  },
+  {
+   "key": "worktree_pool_max",
+   "kind": "setting",
+   "default": "2",
+   "summary": "max FREE pooled worktrees `factory clean` keeps per project when worktree_reuse=1 (0..50)",
+   "goal": "G-002",
+   "doc": "docs/worktree-reuse.md"
+  },
+  {
+   "key": "worktree_reuse",
+   "kind": "flag",
+   "default": "0",
+   "summary": "1 = a new coder task reuses a free pooled worktree of its project instead of creating one",
+   "goal": "G-002",
+   "doc": "docs/worktree-reuse.md",
+   "state": "off"
   }
  ]
 }

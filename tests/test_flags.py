@@ -18,7 +18,7 @@ STATES = {"off", "shadow", "on", "removed"}
 FLAGS = {
     "lead_parking", "stale_policy", "refresh_lane", "lead_less_dispatch", "review_autospawn", "prcheck_required",
     "git_push", "state_push", "mech_merge", "risk_tiers", "red_main_freeze", "gate_sandbox", "test_sandbox",
-    "test_cgroup", "test_sandbox_subuid", "gate_post_status", "sandbox_roles", "worker_gh_roles", "task_clones",
+    "test_cgroup", "test_sandbox_subuid", "gate_post_status", "sandbox_roles", "worker_gh_roles", "task_clones", "worktree_reuse",
     "tick_async_start", "lead_wake_debounce_s", "tick_phase_timers", "orphan_reap_mode", "scout_enabled",
     "gate_fast_projects", "issue_intake_repos", "cursor_pilot_roles", "agent_runtimes",
     "red_pr_owner_alert", "coder_ci_handoff", "idle_coder_reap", "judge_wait_main_run",

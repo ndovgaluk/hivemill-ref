@@ -79,3 +79,5 @@ worker-guard refuses direct reads of the terms file by any path form (compared b
 - a recursive read that reaches the directory through a command or shell form not listed above (accepted as documented residual by the director).
 
 Backstops: the public text guard refuses owner terms in every push, PR, comment and commit (fail closed), and G-010 sandboxing keeps the owner's config directory out of sandboxed workers. The guard stops accidents, not deliberate evasion.
+
+See also [worktree-reuse.md](worktree-reuse.md): pooled worktrees are ownership-checked before use (accepted same-uid TOCTOU residual).

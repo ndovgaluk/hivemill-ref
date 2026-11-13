@@ -810,6 +810,161 @@ class CleanPoolTests(CleanTests):
 
 
 # CleanPoolTests reuses CleanTests' fixtures only: hide the inherited test_* methods (the loader skips non-callables)
+class WorktreeReuseLifecycleTests(FactoryTestCase):
+    """G-002 D: spawn -> merge -> clean (pool) -> spawn (reuse) -> clean (trim), through bin/factory subprocesses only.
+    Real temp repo + local bare origin; PR states come from the gh stub; no pool row is ever written by the test."""
+
+    def setUp(self):
+        super().setUp()
+        e = self.env
+        self.origin = e.home / "origin.git"
+        self.repo = e.home / "repo"
+        git("init", "-q", "--bare", "-b", "main", str(self.origin), cwd=e.home)
+        git("clone", "-q", str(self.origin), str(self.repo), cwd=e.home)
+        git("checkout", "-q", "-b", "main", cwd=self.repo)
+        (self.repo / "README").write_text("x\n")
+        (self.repo / ".gitignore").write_text("node_modules/\n")
+        git("add", "README", ".gitignore", cwd=self.repo)
+        git("commit", "-q", "-m", "init", cwd=self.repo)
+        git("push", "-q", "-u", "origin", "main", cwd=self.repo)
+        self.wts = e.home_dir / "worktrees"
+        self.wts.mkdir()
+        e.seed_project("zz-test-proj")
+        e.sql("UPDATE projects SET repo_path=? WHERE id='zz-test-proj'", (str(self.repo),))
+        e.seed_goal(project="zz-test-proj")
+        e.seed_agent("zz-test-cleaner", "cleaner", goal="G-001")
+        self.cfg(worktree_reuse="1", worktree_pool_max="1")
+
+    def cfg(self, **kv):
+        for k, v in kv.items():
+            self.env.sql("INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, v))
+
+    def spawn(self, n):
+        self.env.seed_task(f"T-000{n}", status="todo", pr_url=None)
+        p = self.ok("spawn", "coder", "--goal", "G-001", "--task", f"T-000{n}", "--name", f"zz-test-c{n}")
+        self.assertNotIn("QUEUED", p.stdout)
+        return Path(self.env.sql("SELECT worktree FROM tasks WHERE id=?", (f"T-000{n}",))[0]["worktree"])
+
+    def tw(self, n):
+        return self.env.sql("SELECT worktree FROM tasks WHERE id=?", (f"T-000{n}",))[0]["worktree"]
+
+    def merge(self, n, wt):
+        """The task's coder commits, pushes and its PR is merged: what `factory clean` needs to see."""
+        tid, branch = f"T-000{n}", f"factory/t-000{n}"
+        (wt / f"f{n}").write_text("work\n")
+        git("add", f"f{n}", cwd=wt)
+        git("commit", "-q", "-m", f"work {n}", cwd=wt)
+        git("push", "-q", "origin", branch, cwd=wt)
+        url = f"https://github.com/zz-test/repo/pull/{n}"
+        self.env.seed_pr(url, sha=git("rev-parse", "HEAD", cwd=wt), state="MERGED")
+        self.env.sql("UPDATE tasks SET status='done', pr_url=? WHERE id=?", (url, tid))
+        self.env.sql("UPDATE agents SET status='exited' WHERE name=?", (f"zz-test-c{n}",))
+        (wt / "node_modules" / "pkg").mkdir(parents=True, exist_ok=True)
+        (wt / "node_modules" / "pkg" / "index.js").write_text("module.exports = 1\n")
+
+    def clean(self):
+        return self.ok("clean", agent="zz-test-cleaner")
+
+    def pool(self, state=None):
+        q = "SELECT * FROM worktree_pool" + (" WHERE state=?" if state else "") + " ORDER BY path"
+        return self.env.sql(q, (state,) if state else ())
+
+    def listed(self, wt):
+        return str(wt) in git("worktree", "list", cwd=self.repo)
+
+    def new_main_commit(self):
+        (self.repo / "later").write_text("new\n")
+        git("add", "later", cwd=self.repo)
+        git("commit", "-q", "-m", "later", cwd=self.repo)
+        git("push", "-q", "origin", "main", cwd=self.repo)
+
+    def test_flag_on_spawn_merge_pool_reuse_trim(self):
+        # a. fresh W1
+        w1 = self.spawn(1)
+        self.assertEqual(w1, self.wts / "G-001-T-0001")
+        self.merge(1, w1)
+        marker = (w1 / "node_modules" / "pkg" / "index.js").read_bytes()
+        # b. clean pools it
+        p = self.clean()
+        self.assertIn("pooled", p.stdout)
+        self.assertTrue(w1.is_dir())
+        rows = self.pool()
+        self.assertEqual([(r["path"], r["state"]) for r in rows], [(str(w1.resolve()), "free")])
+        # c. origin/main moves
+        self.new_main_commit()
+        # d. T-0002 reuses W1
+        w1b = self.spawn(2)
+        self.assertEqual(self.tw(2), str(w1.resolve()))
+        self.assertEqual(w1b.resolve(), w1.resolve())
+        self.assertEqual(git("symbolic-ref", "HEAD", cwd=w1), "refs/heads/factory/t-0002")
+        self.assertEqual(git("rev-parse", "HEAD", cwd=w1), git("rev-parse", "origin/main", cwd=self.repo))
+        self.assertEqual((w1 / "node_modules" / "pkg" / "index.js").read_bytes(), marker)
+        self.assertEqual(git("status", "--porcelain", "--untracked-files=all", cwd=w1), "")
+        self.assertEqual([(r["path"], r["state"], r["task_id"]) for r in self.pool()], [(str(w1.resolve()), "claimed", "T-0002")])
+        # e. T-0002 done but not yet cleaned: W1 stays claimed, T-0003 gets a fresh W3, T-0004 stays in progress
+        self.merge(2, w1)
+        w3 = self.spawn(3)
+        self.assertNotEqual(self.tw(2), self.tw(3))
+        self.assertEqual(w3, self.wts / "G-001-T-0003")
+        w4 = self.spawn(4)
+        self.assertEqual(w4, self.wts / "G-001-T-0004")
+        self.merge(3, w3)
+        self.assertEqual(self.env.sql("SELECT count(*) c FROM (SELECT 1 FROM worktree_pool WHERE state='claimed' "
+                                      "GROUP BY path HAVING count(*)>1)")[0]["c"], 0)
+        t4_row = self.env.sql("SELECT * FROM worktree_pool WHERE path=?", (str(w4.resolve()),))
+        self.assertEqual(t4_row, [])  # a fresh worktree has no pool row; it must stay that way
+        p = self.clean()
+        free = self.pool("free")
+        self.assertEqual(len(free), 1)
+        kept = [w for w in (w1, w3) if w.exists()]
+        gone = [w for w in (w1, w3) if not w.exists()]
+        self.assertEqual((len(kept), len(gone)), (1, 1))
+        self.assertEqual(free[0]["path"], str(kept[0].resolve()))
+        self.assertTrue(self.listed(kept[0]))
+        self.assertFalse(self.listed(gone[0]))
+        self.assertTrue(w4.is_dir())
+        self.assertTrue(self.listed(w4))
+        self.assertEqual(git("symbolic-ref", "HEAD", cwd=w4), "refs/heads/factory/t-0004")
+        self.assertEqual(self.tw(4), str(w4))
+        self.assertEqual(self.pool("claimed"), [])
+
+    def test_flag_off_lifecycle_unchanged(self):
+        self.cfg(worktree_reuse="0")
+        w1 = self.spawn(1)
+        self.merge(1, w1)
+        p = self.clean()
+        self.assertFalse(w1.exists())
+        self.assertIn("removed merged and clean", " ".join(p.stdout.split()))
+        self.assertNotIn("pooled", p.stdout)
+        self.new_main_commit()
+        w2 = self.spawn(2)
+        self.assertEqual(w2, self.wts / "G-001-T-0002")
+        self.assertNotEqual(w2, w1)
+        self.assertTrue(w2.is_dir())
+        self.assertFalse(self.listed(w1))
+        self.assertEqual(self.env.sql("SELECT count(*) c FROM worktree_pool")[0]["c"], 0)
+
+    def test_flag_off_after_pooling_drains_free_rows_only(self):
+        self.cfg(worktree_pool_max="2")
+        w1, w2 = self.spawn(1), self.spawn(2)
+        self.merge(1, w1)
+        self.merge(2, w2)
+        self.clean()
+        self.assertEqual(len(self.pool("free")), 2)
+        w3 = self.spawn(3)  # reuses one of them
+        self.assertIn(w3.resolve(), (w1.resolve(), w2.resolve()))
+        self.assertEqual((len(self.pool("free")), len(self.pool("claimed"))), (1, 1))
+        claimed_path = Path(self.pool("claimed")[0]["path"])
+        free_path = Path(self.pool("free")[0]["path"])
+        self.cfg(worktree_reuse="0")
+        self.clean()
+        self.assertFalse(free_path.exists())
+        self.assertFalse(self.listed(free_path))
+        self.assertEqual(self.pool("free"), [])
+        self.assertTrue(claimed_path.is_dir())
+        self.assertEqual([(r["path"], r["state"], r["task_id"]) for r in self.pool()], [(str(claimed_path), "claimed", "T-0003")])
+
+
 for _n in [n for n in dir(CleanTests) if n.startswith("test_") and n not in CleanPoolTests.__dict__]:
     setattr(CleanPoolTests, _n, None)
 

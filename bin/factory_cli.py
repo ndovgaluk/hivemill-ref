@@ -9330,6 +9330,152 @@ def trust_task_clone(con, task, wt, add=True):
     return res
 
 
+# ── worktree reuse (G-002 C): claim a pooled worktree at spawn, reset it, fall back to a fresh one ──
+
+_POOL_STATE_FILES = ("config.worktree", "MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "AUTO_MERGE", "CHERRY_PICK_HEAD",
+                     "REVERT_HEAD", "ORIG_HEAD")
+_POOL_STATE_DIRS = ("rebase-merge", "rebase-apply", "sequencer")
+_POOL_STATE_REFS = ("refs/worktree", "refs/bisect", "refs/rewritten")
+
+
+def _pool_state_paths(admin):
+    """Existing per-worktree state entries (files, dirs, symlinks) in a worktree admin dir: the D4 step 2 list."""
+    names = [*_POOL_STATE_FILES, *_POOL_STATE_DIRS]
+    names += [e.name for e in os.scandir(admin) if e.name.startswith("BISECT_")]
+    return [os.path.join(admin, n) for n in names if os.path.lexists(os.path.join(admin, n))]
+
+
+def _pool_sweep(repo, wt, admin):
+    """Delete the previous task's per-worktree git state (step 2). Raises OSError; returns (rc, err) of the ref cleanup."""
+    for p in _pool_state_paths(admin):
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.rmtree(p)
+        else:
+            os.unlink(p)
+    rc, out, err = _wt_git(repo, wt, "for-each-ref", "--format=%(refname)", *_POOL_STATE_REFS)
+    if rc != 0:
+        return rc, err
+    for ref in out.split():
+        rc, _, err = _wt_git(repo, wt, "update-ref", "-d", ref)
+        if rc != 0:
+            return rc, err
+    for r in _POOL_STATE_REFS:  # a planted ref file git no longer lists (broken content) is still state
+        shutil.rmtree(os.path.join(admin, r), ignore_errors=True)
+    return 0, ""
+
+
+def _pool_reset(con, repo, wt, branch, start):
+    """D4 steps 1-7 on a claimed pooled worktree. (True, "", "") or (False, step, error); never raises for git/fs errors.
+    Every git call goes through _wt_git. step "ownership" means no git ran in `wt`."""
+    admin, why = worktree_owns_gitdir(repo, wt)
+    if admin is None:
+        return False, "ownership", why
+    try:
+        rc, err = _pool_sweep(repo, wt, admin)
+    except OSError as e:
+        return False, "state-cleanup", str(e)
+    if rc != 0:
+        return False, "state-cleanup", err
+    if not git_config_guard(con, wt):  # before any checkout: filters and fsmonitor act then
+        return False, "config-guard", ", ".join(git_config_refusal(wt))
+    for step, args in (("checkout", ("checkout", "-q", "-f", "-B", branch, start)), ("reset", ("reset", "-q", "--hard", start)),
+                       ("clean", ("clean", "-q", "-f", "-f", "-d"))):  # never -x: ignored files (node_modules) stay
+        rc, _, err = _wt_git(repo, wt, *args)
+        if rc != 0:
+            return False, step, err or f"git {args[0]} exit {rc}"
+    try:  # reset --hard writes ORIG_HEAD: sweep once more so verification sees only what a fresh worktree has
+        rc, err = _pool_sweep(repo, wt, admin)
+    except OSError as e:
+        return False, "verify", str(e)
+    if rc != 0:
+        return False, "verify", err
+    rc, head, err = _wt_git(repo, wt, "symbolic-ref", "HEAD")
+    if rc != 0 or head != f"refs/heads/{branch}":
+        return False, "verify", f"HEAD is {head or err!r}, not refs/heads/{branch}"
+    rc, sha, err = _wt_git(repo, wt, "rev-parse", "HEAD")
+    rc2, want, err2 = _wt_git(repo, wt, "rev-parse", "--verify", f"{start}^{{commit}}")
+    if rc != 0 or rc2 != 0 or sha != want:
+        return False, "verify", f"HEAD {sha or err} is not {start} {want or err2}"
+    rc, out, err = _wt_git(repo, wt, "status", "--porcelain", "--untracked-files=all")
+    if rc != 0 or out:
+        return False, "verify", f"worktree not clean: {(out or err)[:200]}"
+    rc, out, err = _wt_git(repo, wt, "for-each-ref", "--format=%(refname)", *_POOL_STATE_REFS)
+    if rc != 0 or out:
+        return False, "verify", f"per-worktree refs left: {(out or err)[:200]}"
+    try:
+        left = _pool_state_paths(admin)
+    except OSError as e:
+        return False, "verify", str(e)
+    if left:
+        return False, "verify", f"per-worktree state left: {', '.join(os.path.basename(p) for p in left)}"
+    if not git_config_guard(con, wt):
+        return False, "verify", "git config guard refused after reset: " + ", ".join(git_config_refusal(wt))
+    return True, "", ""
+
+
+def _pool_mismatch(con, task, path, why):
+    """Ownership of a claimed pool row failed: delete the row, keep the dir, one event, one director message an hour."""
+    pool_release_claim(con, path)
+    con.execute("UPDATE tasks SET worktree=NULL WHERE id=? AND worktree=?", (task, str(path)))
+    event(con, "task", task, "worktree-gitdir-mismatch", json.dumps({"path": str(path), "reason": why}))
+    try:
+        last = con.execute("SELECT value FROM config WHERE key='last_pool_mismatch_ts'").fetchone()
+        if not last or time.time() - float(last["value"]) >= 3600:
+            send(con, "director", f"pooled worktree gitdir mismatch: {Path(path).name}"[:80],
+                 f"Pool row {path} does not name a real linked worktree of its repo ({why}). Row dropped, directory kept "
+                 "untouched, no git run in it. Find out who replaced it.", "report", sender="factory")
+            con.execute("INSERT INTO config(key,value) VALUES('last_pool_mismatch_ts',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (str(time.time()),))
+    except (sqlite3.Error, ValueError):
+        pass  # the event above is the record; the alert is best effort
+
+
+def _pool_reuse_failed(con, repo, task, path, step, error):
+    """D6: drop the claim, reset tasks.worktree, remove the dir (kept on an ownership mismatch), record why."""
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        pool_release_claim(con, path)
+        con.execute("UPDATE tasks SET worktree=NULL WHERE id=?", (task,))
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    event(con, "task", task, "worktree-reuse-failed", json.dumps({"path": str(path), "step": step, "error": str(error)[:500]}))
+    rc, _, err = _wt_remove(repo, path)
+    if rc == 126:
+        _pool_mismatch(con, task, path, err)
+    elif rc != 0:
+        print(f"worktree reuse: could not remove {path}: {err}", file=sys.stderr)
+
+
+def _pool_claim_for_spawn(con, repo, project_id, task, branch, start):
+    """Claim and reset a free pooled worktree of the project for `task`. Its path, or None (fresh worktree). Tries
+    each pool row once: a row failing the ownership check is dropped (dir kept) and the next is tried; a reset
+    failure falls back to a fresh worktree at once."""
+    for _ in range(con.execute("SELECT count(*) FROM worktree_pool WHERE project_id=?", (project_id,)).fetchone()[0] + 1):
+        path = pool_claim(con, project_id, task)
+        if path is None:
+            return None
+        con.execute("UPDATE tasks SET worktree=?, branch=? WHERE id=?", (path, branch, task))
+        ok, step, err = _pool_reset(con, repo, path, branch, start)
+        if not ok and step == "ownership":
+            _pool_mismatch(con, task, path, err)
+            continue
+        if not ok:
+            _pool_reuse_failed(con, repo, task, path, step, err)
+            return None
+        install_pre_push_hook(path)
+        con.execute("UPDATE worktree_pool SET reset_ok=1 WHERE path=? AND task_id=? AND state='claimed'", (path, task))
+        m = re.search(r"(T-\d+)$", os.path.basename(path))
+        event(con, "task", task, "worktree-reused", json.dumps({"path": path, "task": task, "from_task": m.group(1) if m else None}))
+        return path
+    return None
+
+
+def _pool_reuse_on(con):
+    return cfg(con, "worktree_reuse") == "1" and cfg(con, "task_clones") != "1"
+
+
 def prepare_worktree(con, task, role):
     """Coder gets a fresh worktree on factory/<task> from origin/<base>; QA/reviewer reuse it read-only."""
     if not task:
@@ -9338,6 +9484,31 @@ def prepare_worktree(con, task, role):
                     "LEFT JOIN projects p ON p.id=g.project_id WHERE t.id=?", (task,)).fetchone()
     if not t or not t["repo_path"]:
         return None
+    reuse_on = role == "coder" and _pool_reuse_on(con)
+    if reuse_on and t["worktree"] and Path(t["worktree"]).exists() and t["branch"] and con.execute(
+            "SELECT 1 FROM worktree_pool WHERE path=? AND task_id=? AND state='claimed' AND reset_ok=0",
+            (str(t["worktree"]), task)).fetchone():
+        # D7: spawn died after the claim, before the reset finished: reset again instead of a plain switch
+        repo, base = t["repo_path"], t["base_branch"] or "main"
+        if not git_config_guard(con, repo):
+            con.commit()
+            die(f"spawn refused: git config in {repo} would run code: {', '.join(git_config_refusal(repo))}", 4)
+        git_run(repo, "fetch", "-q", "origin", text=False)
+        has_remote = git_run(repo, "rev-parse", "--verify", "-q", f"origin/{base}", text=False).returncode == 0
+        ok, step, err = _pool_reset(con, repo, t["worktree"], t["branch"], f"origin/{base}" if has_remote else base)
+        if ok:
+            install_pre_push_hook(t["worktree"])
+            con.execute("UPDATE worktree_pool SET reset_ok=1 WHERE path=? AND task_id=?", (str(t["worktree"]), task))
+            event(con, "task", task, "worktree-reused", json.dumps({"path": t["worktree"], "task": task, "from_task": None, "recovered": True}))
+            return t["worktree"]
+        if step == "ownership":
+            _pool_mismatch(con, task, t["worktree"], err)
+        else:
+            _pool_reuse_failed(con, repo, task, t["worktree"], step, err)
+        t = dict(t, worktree=None)
+    if reuse_on and t["worktree"] and not Path(t["worktree"]).exists():
+        # a claim whose directory is gone can never be reused: drop the stale row, a fresh worktree follows
+        con.execute("DELETE FROM worktree_pool WHERE path=? AND task_id=? AND state='claimed'", (str(t["worktree"]), task))
     if t["worktree"] and Path(t["worktree"]).exists():
         if role == "coder" and t["branch"]:
             if not git_config_guard(con, t["worktree"]):
@@ -9363,6 +9534,11 @@ def prepare_worktree(con, task, role):
         install_pre_push_hook(wt)
         con.execute("UPDATE tasks SET worktree=?, branch=? WHERE id=?", (str(wt), branch, task))
         return str(wt)
+    if reuse_on:
+        project_id = con.execute("SELECT project_id FROM goals WHERE id=?", (t["goal_id"],)).fetchone()[0]
+        got = _pool_claim_for_spawn(con, repo, project_id, task, branch, start)
+        if got:
+            return got
     branch_existed = git_run(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}", text=False).returncode == 0
     p = git_run(repo, "worktree", "add", "--no-checkout", "-q", "-B", branch, str(wt), start)
     if p.returncode != 0:

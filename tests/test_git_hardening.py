@@ -2,12 +2,15 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from harness import FactoryTestCase, git
+from harness import FactoryEnv
 
 SAFE = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
 
@@ -744,6 +747,398 @@ class WorktreeOwnershipTests(FactoryTestCase):
         self.assertEqual(rc, 0, err)
         self.assertFalse(self.A.exists())
         self.assert_sibling_intact()
+
+
+class WorktreeReuseSpawnTests(FactoryTestCase):
+    """G-002 C: `factory spawn coder` with worktree_reuse=1 claims a free pooled worktree of the project, resets it, and
+    falls back to a fresh worktree (fail closed) on any problem. Real temp repo + local bare origin; the pool row comes
+    from a real `factory clean` of a merged task. Spawns run as subprocesses through the harness."""
+
+    def setUp(self):
+        super().setUp()
+        self.build()
+
+    def build(self):
+        """(Re)build repo, origin, project and goal inside self.env."""
+        e = self.env
+        self.origin = e.home / "origin.git"
+        self.repo = e.home / "repo"
+        git("init", "-q", "--bare", "-b", "main", str(self.origin), cwd=e.home)
+        git("clone", "-q", str(self.origin), str(self.repo), cwd=e.home)
+        git("checkout", "-q", "-b", "main", cwd=self.repo)
+        (self.repo / "README").write_text("x\n")
+        (self.repo / ".gitignore").write_text("node_modules/\n")
+        git("add", "README", ".gitignore", cwd=self.repo)
+        git("commit", "-q", "-m", "init", cwd=self.repo)
+        git("push", "-q", "-u", "origin", "main", cwd=self.repo)
+        self.wts = e.home_dir / "worktrees"
+        self.wts.mkdir(exist_ok=True)
+        e.seed_project("zz-test-proj")
+        e.sql("UPDATE projects SET repo_path=? WHERE id='zz-test-proj'", (str(self.repo),))
+        e.seed_goal(project="zz-test-proj")
+        e.seed_agent("zz-test-cleaner", "cleaner", goal="G-001")
+        self.set_cfg(worktree_reuse="1", worktree_pool_max="2")
+
+    def set_cfg(self, **kv):
+        for k, v in kv.items():
+            self.env.sql("INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, v))
+
+    def rows(self):
+        return self.env.sql("SELECT * FROM worktree_pool ORDER BY path")
+
+    def events(self, action):
+        return self.env.sql("SELECT detail FROM events WHERE action=?", (action,))
+
+    def tw(self, tid):
+        return self.env.sql("SELECT worktree FROM tasks WHERE id=?", (tid,))[0]["worktree"]
+
+    def pooled(self, n=1, node_modules=True):
+        """A merged, pushed task T-000<n> whose worktree a real `factory clean` pools; its path."""
+        e = self.env
+        tid, branch = f"T-000{n}", f"factory/t-000{n}"
+        url = f"https://github.com/zz-test/repo/pull/{n}"
+        wt = self.wts / f"G-001-{tid}"
+        git("worktree", "add", "-q", "-b", branch, str(wt), "origin/main", cwd=self.repo)
+        (wt / f"f{n}").write_text("work\n")
+        git("add", f"f{n}", cwd=wt)
+        git("commit", "-q", "-m", f"work {n}", cwd=wt)
+        git("push", "-q", "origin", branch, cwd=wt)
+        e.seed_task(tid, status="done", pr_url=url)
+        e.sql("UPDATE tasks SET worktree=?, branch=? WHERE id=?", (str(wt), branch, tid))
+        e.seed_pr(url, sha=git("rev-parse", "HEAD", cwd=wt), state="MERGED")
+        if node_modules:
+            (wt / "node_modules" / "pkg").mkdir(parents=True)
+            (wt / "node_modules" / "pkg" / "index.js").write_text("module.exports = 1\n")
+        p = self.ok("clean", agent="zz-test-cleaner")
+        self.assertIn("released to pool", p.stdout)
+        path = str(wt.resolve())
+        self.assertEqual([r["path"] for r in self.rows() if r["state"] == "free" and r["path"] == path], [path])
+        return wt.resolve()
+
+    def todo(self, n):
+        self.env.seed_task(f"T-000{n}", status="todo", pr_url=None)
+
+    def spawn(self, n, extra_env=None, expect=0):
+        p = self.env.run("spawn", "coder", "--goal", "G-001", "--task", f"T-000{n}", "--name", f"zz-test-c{n}", extra_env=extra_env)
+        self.assertEqual(p.returncode, expect, f"rc={p.returncode}\n{p.stdout}\n{p.stderr}")
+        self.assertNotIn("QUEUED", p.stdout)
+        return p
+
+    def admin(self, wt):
+        return Path(git("rev-parse", "--absolute-git-dir", cwd=wt))
+
+    def shim(self, body):
+        """A git shim ahead of PATH: `body` is sh run before the real git ($* is the git argv)."""
+        d = self.env.home / "shim"
+        d.mkdir(exist_ok=True)
+        log = self.env.home / "git-calls.log"
+        sh = d / "git"
+        sh.write_text(f'#!/bin/sh\n{body}\nprintf \'%s\\t%s\\n\' "" "$*" >> {log}\nexec {shutil.which("git")} "$@"\n')
+        sh.chmod(0o755)
+        return {"PATH": f"{d}{os.pathsep}{self.env.stub_bin}{os.pathsep}{os.environ['PATH']}"}, log
+
+    # 1 flag off
+    def test_flag_off_creates_fresh_worktree_and_leaves_pool_alone(self):
+        P = self.pooled()
+        self.set_cfg(worktree_reuse="0")
+        before = self.rows()
+        self.todo(2)
+        self.spawn(2)
+        self.assertEqual(self.tw("T-0002"), str(self.wts / "G-001-T-0002"))
+        self.assertTrue((self.wts / "G-001-T-0002").is_dir())
+        self.assertEqual(self.rows(), before)
+        self.assertEqual(self.env.sql("SELECT count(*) c FROM worktree_pool WHERE state='claimed'")[0]["c"], 0)
+        self.assertEqual(self.events("worktree-reused"), [])
+        self.assertTrue(P.exists())
+
+    # 2 reuse
+    def test_reuse_claims_resets_and_keeps_ignored_files(self):
+        P = self.pooled()
+        (self.repo / "later").write_text("new\n")
+        git("add", "later", cwd=self.repo)
+        git("commit", "-q", "-m", "later", cwd=self.repo)
+        git("push", "-q", "origin", "main", cwd=self.repo)
+        self.todo(2)
+        self.spawn(2)
+        self.assertEqual(self.tw("T-0002"), str(P))
+        rows = self.rows()
+        self.assertEqual([(r["path"], r["state"], r["task_id"], r["reset_ok"]) for r in rows], [(str(P), "claimed", "T-0002", 1)])
+        self.assertEqual(git("symbolic-ref", "HEAD", cwd=P), "refs/heads/factory/t-0002")
+        self.assertEqual(git("rev-parse", "HEAD", cwd=P), git("rev-parse", "origin/main", cwd=self.repo))
+        self.assertEqual((P / "node_modules" / "pkg" / "index.js").read_text(), "module.exports = 1\n")
+        self.assertTrue((P / "later").exists())
+        ev = self.events("worktree-reused")
+        self.assertEqual(len(ev), 1)
+        d = json.loads(ev[0]["detail"])
+        self.assertEqual((d["path"], d["task"], d["from_task"]), (str(P), "T-0002", "T-0001"))
+        self.assertEqual(self.env.sql("SELECT branch FROM tasks WHERE id='T-0002'")[0]["branch"], "factory/t-0002")
+        self.assertFalse((self.wts / "G-001-T-0002").exists())
+
+    # 3 untracked removed
+    def test_untracked_and_modified_state_removed_ignored_kept(self):
+        P = self.pooled()
+        (P / "u.txt").write_text("u\n")
+        (P / "d").mkdir()
+        (P / "d" / "x").write_text("x\n")
+        (P / "README").write_text("modified\n")
+        (P / "staged").write_text("s\n")
+        git("add", "staged", cwd=P)
+        git("init", "-q", "n", cwd=P)
+        (P / "n" / "inner").write_text("i\n")
+        self.todo(2)
+        self.spawn(2)
+        self.assertEqual(self.tw("T-0002"), str(P))
+        self.assertEqual(git("status", "--porcelain", "--untracked-files=all", cwd=P), "")
+        for gone in ("u.txt", "d", "staged", "n"):
+            self.assertFalse((P / gone).exists(), gone)
+        self.assertEqual((P / "README").read_text(), "x\n")
+        self.assertTrue((P / "node_modules" / "pkg" / "index.js").exists())
+
+    # 4 per-worktree config + guard order
+    def test_config_worktree_removed_and_guard_runs_before_checkout(self):
+        P = self.pooled()
+        cw = self.admin(P) / "config.worktree"
+        cw.write_text("[user]\n\tname = previous-task\n")
+        env, log = self.shim("")
+        sh = self.env.home / "shim" / "git"
+        sh.write_text(f'#!/bin/sh\nif [ -e "{cw}" ]; then c=1; else c=0; fi\n'
+                      f'printf \'%s\\t%s\\n\' "$c" "$*" >> {log}\nexec {shutil.which("git")} "$@"\n')
+        self.todo(2)
+        self.spawn(2, extra_env=env)
+        self.assertFalse(cw.exists())
+        self.assertEqual(self.tw("T-0002"), str(P))
+        calls = [l.split("\t", 1) for l in log.read_text().splitlines()]
+        checkouts = [i for i, (_, a) in enumerate(calls) if " checkout " in f" {a} " and "-B" in a]
+        self.assertTrue(checkouts)
+        self.assertEqual(calls[checkouts[0]][0], "0", "config.worktree still existed at checkout")
+        self.assertTrue(any(c == "1" and "config" in a and "--file" in a for c, a in calls[:checkouts[0]]),
+                        "no git config --file call ran while config.worktree still existed")
+        # the pooled worktree's own config guard (git_config_refusal(P) starts with this rev-parse), not prepare_worktree's repo-level one
+        guards = [i for i, (_, a) in enumerate(calls) if a.startswith(f"-C {P} ") and "rev-parse --git-dir --git-common-dir" in a]
+        sweep = max(i for i, (c, _) in enumerate(calls[:checkouts[0]]) if c == "1")
+        cleans = [i for i, (_, a) in enumerate(calls) if f"--work-tree={P} " in a and " clean " in f" {a} "]
+        self.assertTrue(cleans, "no git clean ran in the pooled worktree")
+        self.assertTrue(any(sweep < i < checkouts[0] for i in guards),
+                        "no config guard on the pooled worktree between the config.worktree sweep and the first checkout -B")
+        self.assertTrue(any(i > cleans[0] for i in guards),
+                        "no config guard on the pooled worktree after git clean")
+
+    def test_forbidden_config_worktree_refuses_spawn_and_runs_nothing(self):
+        P = self.pooled()
+        marker = self.env.home / "marker"
+        script = self.env.home / "mon.sh"
+        script.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        script.chmod(0o755)
+        (self.admin(P) / "config.worktree").write_text(f"[core]\n\tfsmonitor = {script}\n")
+        self.todo(2)
+        p = self.spawn(2, expect=4)
+        self.assertIn("spawn refused: git config in", p.stderr + p.stdout)
+        self.assertFalse(marker.exists())
+        self.assertEqual([r["state"] for r in self.rows()], ["free"])
+
+    # 5 leftover git state
+    def test_leftover_git_state_removed(self):
+        P = self.pooled()
+        adm = self.admin(P)
+        sha = git("rev-parse", "HEAD", cwd=P)
+        for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "MERGE_MSG", "ORIG_HEAD"):
+            (adm / n).write_text(sha + "\n")
+        for d in ("rebase-merge", "rebase-apply", "sequencer"):
+            (adm / d).mkdir()
+            (adm / d / "x").write_text("x\n")
+        git("update-ref", "refs/worktree/x", "HEAD", cwd=P)
+        git("update-ref", "refs/bisect/bad", "HEAD", cwd=P)
+        self.todo(2)
+        self.spawn(2)
+        self.assertEqual(self.tw("T-0002"), str(P))
+        for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "MERGE_MSG", "ORIG_HEAD", "rebase-merge", "rebase-apply", "sequencer"):
+            self.assertFalse((adm / n).exists(), n)
+        self.assertEqual(git("for-each-ref", "refs/worktree", "refs/bisect", cwd=P), "")
+
+    # 6 fallback, fail closed
+    def test_reset_failure_falls_back_to_fresh_worktree(self):
+        P = self.pooled()
+        env, _ = self.shim('case " $* " in *" reset "*) echo "boom" >&2; exit 1;; esac')
+        self.todo(2)
+        self.spawn(2, extra_env=env)
+        fresh = self.wts / "G-001-T-0002"
+        self.assertEqual(self.tw("T-0002"), str(fresh))
+        self.assertTrue(fresh.is_dir())
+        self.assertFalse(P.exists())
+        self.assertEqual(self.rows(), [])
+        ev = self.events("worktree-reuse-failed")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(json.loads(ev[0]["detail"])["step"], "reset")
+        self.assertEqual(self.events("worktree-reused"), [])
+
+    def test_branch_checked_out_elsewhere_is_a_step_failure(self):
+        P = self.pooled()
+        other = self.wts / "other"
+        git("worktree", "add", "-q", "-b", "factory/t-0002", str(other), "origin/main", cwd=self.repo)
+        self.todo(2)
+        self.spawn(2, expect=1)  # the fresh path hits the same branch conflict, exactly as today
+        self.assertFalse(P.exists())
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(json.loads(self.events("worktree-reuse-failed")[0]["detail"])["step"], "checkout")
+        self.assertTrue(other.is_dir())
+
+    def test_symlinked_and_forged_pool_rows_keep_dirs_and_siblings(self):
+        S = self.pooled(1, node_modules=False)
+        forged = self.pooled(4, node_modules=False)
+        self.env.sql("UPDATE worktree_pool SET state='claimed', task_id='T-0001', claimed_at='t' WHERE path=?", (str(S),))
+        (forged / ".git").write_text(f"gitdir: {self.admin(S)}\n")
+        link = self.wts / "link"
+        link.symlink_to(S)
+        self.env.sql("INSERT INTO worktree_pool(path,project_id,state,task_id,reset_ok,claimed_at,released_at) "
+                     "VALUES(?,?,?,NULL,1,NULL,'2026-01-01T00:00:00+00:00')", (str(link), "zz-test-proj", "free"))
+        snap = lambda: [hashlib.sha256((self.admin(S) / n).read_bytes()).hexdigest() for n in ("HEAD", "index")]
+        before = snap()
+        self.todo(2)
+        self.spawn(2)
+        self.assertEqual(snap(), before)
+        self.assertTrue(S.is_dir() and forged.is_dir() and link.is_symlink())
+        self.assertEqual(len(self.events("worktree-gitdir-mismatch")), 2)
+        self.assertEqual([r["task_id"] for r in self.rows()], ["T-0001"])
+        self.assertEqual(self.tw("T-0002"), str(self.wts / "G-001-T-0002"))
+        self.assertTrue((self.wts / "G-001-T-0002").is_dir())
+
+    def test_repo_level_planted_config_still_exits_4(self):
+        P = self.pooled()
+        git("config", "core.fsmonitor", "/bin/true", cwd=self.repo)
+        self.todo(2)
+        p = self.spawn(2, expect=4)
+        self.assertIn("spawn refused: git config in", p.stderr + p.stdout)
+        self.assertEqual([(r["path"], r["state"]) for r in self.rows()], [(str(P), "free")])
+
+    # 7, 8 concurrency
+    def race(self, free_rows):
+        """Fresh env, `free_rows` pooled worktrees, T-0002 and T-0003 spawned together; their worktrees."""
+        self.env = FactoryEnv()
+        self.addCleanup(self.env.cleanup)
+        self.build()
+        pool = [self.pooled(n) for n in (1, 4)[:free_rows]]
+        self.todo(2)
+        self.todo(3)
+        gate = threading.Barrier(2)
+        out = {}
+        lock_dir = self.env.home / "locked-stubs"  # the pane/gh stubs keep state in one JSON file and are not safe to run twice at once
+        lock_dir.mkdir()
+        for tool in ("herdr", "gh", "hc"):
+            wrapper = lock_dir / tool
+            wrapper.write_text(f'#!/bin/sh\nexec flock {self.env.home}/stub.lock {self.env.stub_bin}/{tool} "$@"\n')
+            wrapper.chmod(0o755)
+        path = {"PATH": f"{lock_dir}{os.pathsep}{self.env.stub_bin}{os.pathsep}{os.environ['PATH']}"}
+
+        def go(n):
+            gate.wait()
+            out[n] = self.env.run("spawn", "coder", "--goal", "G-001", "--task", f"T-000{n}", "--name", f"zz-test-c{n}", extra_env=path)
+
+        ts = [threading.Thread(target=go, args=(n,)) for n in (2, 3)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        for n, p in out.items():
+            self.assertEqual(p.returncode, 0, f"T-000{n}: {p.stdout}\n{p.stderr}")
+            self.assertNotIn("QUEUED", p.stdout)
+        return [str(x) for x in pool], [self.tw("T-0002"), self.tw("T-0003")]
+
+    def test_concurrent_spawns_one_free_row_five_rounds(self):
+        for rnd in range(5):
+            pool, got = self.race(1)
+            self.assertEqual(len(set(got)), 2, f"round {rnd}: both tasks got {got}")
+            self.assertEqual(sum(g == pool[0] for g in got), 1, f"round {rnd}: {got}")
+            self.assertEqual(sum(g.endswith(("G-001-T-0002", "G-001-T-0003")) for g in got), 1)
+            self.assertEqual(self.env.sql("SELECT count(*) c FROM worktree_pool WHERE state='claimed'")[0]["c"], 1)
+            self.assertEqual(self.env.sql("SELECT task_id, count(*) c FROM worktree_pool WHERE state='claimed' GROUP BY task_id HAVING count(*)>1"), [])
+            print(f"concurrency round {rnd + 1}/5: pool={pool[0]} T-0002={got[0]} T-0003={got[1]}")
+
+    def test_concurrent_spawns_two_free_rows_both_reused(self):
+        pool, got = self.race(2)
+        self.assertEqual(sorted(got), sorted(pool))
+        self.assertEqual(self.env.sql("SELECT count(*) c FROM worktree_pool WHERE state='claimed'")[0]["c"], 2)
+        self.assertEqual(self.env.sql("SELECT task_id, count(*) c FROM worktree_pool WHERE state='claimed' GROUP BY task_id HAVING count(*)>1"), [])
+
+    def test_claim_is_exclusive_between_its_select_and_its_update(self):
+        """Deterministic race: a second connection tries to claim exactly between pool_claim's SELECT and UPDATE."""
+        P = self.pooled()
+        self.todo(2)
+        self.todo(3)
+        cm = self.env.load_factory()
+        mod = cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+        con1, con2 = mod.db(), mod.db()
+        con2.execute("PRAGMA busy_timeout=100")
+        seen = []
+
+        class Racer:
+            def __init__(self, con):
+                self.con = con
+
+            def execute(self, sql, *a):
+                r = self.con.execute(sql, *a)
+                if sql.startswith("SELECT path FROM worktree_pool") and not seen:
+                    try:
+                        seen.append(mod.pool_claim(con2, "zz-test-proj", "T-0003"))
+                    except sqlite3.OperationalError as e:
+                        seen.append(f"locked: {e}")
+                return r
+
+        got = mod.pool_claim(Racer(con1), "zz-test-proj", "T-0002")
+        self.assertEqual(got, str(P))
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0] is None or seen[0].startswith("locked"), f"second claimer got {seen[0]!r}")
+        self.assertEqual([(r["task_id"], r["state"]) for r in self.rows()], [("T-0002", "claimed")])
+
+    # 9 crash recovery
+    def claimed_for(self, P, reset_ok):
+        self.todo(2)
+        self.env.sql("UPDATE worktree_pool SET state='claimed', task_id='T-0002', reset_ok=?, claimed_at='t' WHERE path=?", (reset_ok, str(P)))
+        self.env.sql("UPDATE tasks SET worktree=?, branch='factory/t-0002' WHERE id='T-0002'", (str(P),))
+
+    def test_crash_before_reset_ok_reruns_the_reset(self):
+        P = self.pooled()
+        self.claimed_for(P, 0)
+        (P / "leftover.txt").write_text("x\n")
+        self.spawn(2)
+        self.assertFalse((P / "leftover.txt").exists())
+        self.assertEqual([(r["task_id"], r["reset_ok"]) for r in self.rows()], [("T-0002", 1)])
+        self.assertEqual(git("symbolic-ref", "HEAD", cwd=P), "refs/heads/factory/t-0002")
+        self.assertEqual(self.tw("T-0002"), str(P))
+
+    def test_claimed_row_with_missing_directory_is_dropped(self):
+        P = self.pooled()
+        self.claimed_for(P, 0)
+        self.assertEqual(self.mod_rm(P), 0)
+        self.spawn(2)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.tw("T-0002"), str(self.wts / "G-001-T-0002"))
+
+    def mod_rm(self, P):
+        git("worktree", "remove", "--force", str(P), cwd=self.repo)
+        return 0
+
+    def test_reset_done_existing_worktree_path_unchanged(self):
+        P = self.pooled()
+        git("checkout", "-q", "-B", "factory/t-0002", "origin/main", cwd=P)
+        self.claimed_for(P, 1)
+        (P / "wip.txt").write_text("work in progress\n")
+        self.spawn(2)
+        self.assertEqual((P / "wip.txt").read_text(), "work in progress\n")
+        self.assertEqual(self.events("worktree-reused"), [])
+        self.assertEqual(self.tw("T-0002"), str(P))
+
+    # 10 task_clones wins
+    def test_task_clones_wins_over_reuse(self):
+        self.pooled()
+        self.set_cfg(task_clones="1")
+        before = self.rows()
+        self.todo(2)
+        self.spawn(2)
+        clone = self.wts / "G-001-T-0002"
+        self.assertTrue((clone / ".git").is_dir())
+        self.assertEqual(self.tw("T-0002"), str(clone))
+        self.assertEqual(self.rows(), before)
+        self.assertEqual(self.events("worktree-reused"), [])
+
 
 
 if __name__ == "__main__":

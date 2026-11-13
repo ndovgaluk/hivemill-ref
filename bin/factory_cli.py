@@ -12628,8 +12628,10 @@ def _clean_pool_sweep(con, rows, repos, panes, pane_cwds, listed, dry_run, reuse
     # trim: per project, free rows over the cap, oldest released_at first
     cap = pool_max if reuse_on else 0
     free = {}
+    released = {}
     for f in con.execute("SELECT * FROM worktree_pool WHERE state='free' ORDER BY released_at, path").fetchall():
         free.setdefault(f["project_id"], []).append(f["path"])
+        released[f["path"]] = f["released_at"]
     for path, (pid, _) in virtual_free.items():
         free.setdefault(pid, []).append(path)
     for pid, paths in sorted(free.items()):
@@ -12658,7 +12660,15 @@ def _clean_pool_sweep(con, rows, repos, panes, pane_cwds, listed, dry_run, reuse
                 else:
                     row["action"], row["reason"] = "would remove", "pool over cap"
                 continue
+            # take the row out of the pool first (only while it is still free): a spawn claiming it meanwhile wins and
+            # the dir stays; put the row back if the removal does not happen
+            if con.execute("DELETE FROM worktree_pool WHERE path=? AND state='free'", (path,)).rowcount != 1:
+                row["reason"] = "claimed meanwhile"
+                continue
             rc, _, err = _wt_remove(repo, Path(path))
+            if rc != 0:
+                pool_free(con, path, pid)
+                con.execute("UPDATE worktree_pool SET released_at=? WHERE path=?", (released[path], path))
             if rc == 126:  # _wt_remove refused: not a worktree of this project (symlink, forged .git); nothing was touched
                 _clean_pool_alert(con, path, err, dry_run)
                 row["reason"] = "kept: gitdir mismatch"
@@ -12666,7 +12676,6 @@ def _clean_pool_sweep(con, rows, repos, panes, pane_cwds, listed, dry_run, reuse
             if rc != 0:
                 row["reason"] = "worktree remove failed: " + err[:80]
                 continue
-            pool_release_claim(con, path)
             event(con, "pool", "-", "worktree-pool-trimmed", {"path": path, "project": pid})
             row["action"], row["reason"] = "removed", "pool over cap"
 

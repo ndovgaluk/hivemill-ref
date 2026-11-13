@@ -754,6 +754,62 @@ class CleanPoolTests(CleanTests):
         self.assertFalse(wt.exists())
         self.assertEqual(self.rows(), [])
 
+    # M513: a dir whose admin dir holds config.worktree is never pooled
+    def admin_of(self, wt):
+        return Path(git("rev-parse", "--absolute-git-dir", cwd=wt))
+
+    def row_for(self, out, task):
+        return [" ".join(l.split()) for l in out.splitlines() if l.startswith(task)]
+
+    def test_forbidden_config_worktree_not_pooled(self):
+        self.cfg()
+        wt, branch, _ = self.task()
+        marker = self.env.home / "marker"
+        script = self.env.home / "mon.sh"
+        script.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        script.chmod(0o755)
+        (self.admin_of(wt) / "config.worktree").write_text(f"[core]\n\tfsmonitor = {script}\n")
+        for args in (("--dry-run",), ()):
+            p = self.clean(*args)
+            rows = self.row_for(p.stdout, "T-0001")
+            self.assertEqual(len(rows), 1, p.stdout)
+            self.assertIn(" skip git config refused", rows[0])
+            self.assertEqual(self.env.sql("SELECT count(*) c FROM worktree_pool")[0]["c"], 0)
+            self.assertTrue(wt.is_dir())
+            self.assertIn(branch, self.branches())
+            self.assertFalse(marker.exists(), "core.fsmonitor command ran")
+
+    def test_config_worktree_with_allowed_keys_not_pooled(self):
+        self.cfg()
+        wt1, branch, _ = self.task(1)
+        wt2, _, _ = self.task(2, url=URL2)
+        before = self.env.sql("SELECT worktree FROM tasks WHERE id='T-0001'")[0]["worktree"]
+        (self.admin_of(wt1) / "config.worktree").write_text("[user]\n\tname = previous-task\n")
+        for args in (("--dry-run",), ()):
+            p = self.clean(*args)
+            rows = self.row_for(p.stdout, "T-0001")
+            self.assertEqual(len(rows), 1, p.stdout)
+            self.assertTrue(rows[0].endswith(" skip kept: has config.worktree"), rows[0])
+            self.assertEqual([r["path"] for r in self.rows()], [] if args else [str(wt2.resolve())])
+            self.assertTrue(wt1.is_dir())
+            self.assertEqual(git("symbolic-ref", "HEAD", cwd=wt1), "refs/heads/factory/t-0001")
+            self.assertEqual(self.env.sql("SELECT worktree FROM tasks WHERE id='T-0001'")[0]["worktree"], before)
+            self.assertEqual(self.events("worktree-pooled") and [e for e in self.events("worktree-pooled") if "T-0001" in e["detail"]], [])
+        self.assertEqual([r["state"] for r in self.rows()], ["free"])
+        self.assertIn(branch, self.branches())
+
+    def test_stale_claim_with_config_worktree_stays_claimed(self):
+        self.cfg(pool_max="5")
+        self.env.seed_task("T-0009", status="done", pr_url=None)
+        wt = self.pool_wt("stale-cw", state="claimed", task="T-0009")
+        (self.admin_of(wt) / "config.worktree").write_text("[user]\n\tname = previous-task\n")
+        for args in (("--dry-run",), ()):
+            p = self.clean(*args)
+            self.assertIn("kept: has config.worktree", p.stdout)
+            rows = self.rows()
+            self.assertEqual([(r["state"], r["task_id"]) for r in rows], [("claimed", "T-0009")])
+            self.assertTrue(wt.exists())
+
     # 9 dry run
     def test_dry_run_changes_nothing(self):
         self.cfg(pool_max="2")
@@ -1021,6 +1077,50 @@ class WorktreeReuseLifecycleTests(FactoryTestCase):
         self.assertEqual(self.pool("free"), [])
         self.assertTrue(claimed_path.is_dir())
         self.assertEqual([(r["path"], r["state"], r["task_id"]) for r in self.pool()], [(str(claimed_path), "claimed", "T-0003")])
+
+    def poison(self, wt):
+        """Forbidden core.fsmonitor in wt's admin config.worktree; returns (marker, config.worktree path)."""
+        marker = self.env.home / "marker"
+        script = self.env.home / "mon.sh"
+        script.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        script.chmod(0o755)
+        cw = Path(git("rev-parse", "--absolute-git-dir", cwd=wt)) / "config.worktree"
+        cw.write_text(f"[core]\n\tfsmonitor = {script}\n")
+        return marker, cw
+
+    def spawn_rc(self, n):
+        self.env.seed_task(f"T-000{n}", status="todo", pr_url=None)
+        return self.refused(4, "spawn", "coder", "--goal", "G-001", "--task", f"T-000{n}", "--name", f"zz-test-c{n}")
+
+    def test_poisoned_pooled_worktree_spawn_message(self):
+        w1 = self.spawn(1)
+        self.merge(1, w1)
+        self.clean()
+        self.assertEqual([r["state"] for r in self.pool()], ["free"])
+        marker, cw = self.poison(w1)
+        p = self.spawn_rc(2)
+        out = p.stdout + p.stderr
+        self.assertIn("spawn refused: git config in", out)
+        self.assertIn(f"pooled worktree {w1.resolve()} (free) has ", out)
+        self.assertIn("config.worktree: move that file out of the repository", out)
+        self.assertIn("Poisoned pooled worktree", out)
+        self.assertFalse(marker.exists())
+        self.assertEqual([r["state"] for r in self.pool()], ["free"])
+        self.assertIsNone(self.tw(2))
+        quarantine = self.env.home / "quarantine"
+        quarantine.mkdir()
+        cw.rename(quarantine / "config.worktree")
+        self.ok("spawn", "coder", "--goal", "G-001", "--task", "T-0002", "--name", "zz-test-c2")
+        self.assertEqual(self.tw(2), str(w1.resolve()))
+
+    def test_poisoned_unpooled_worktree_message_unchanged(self):
+        w1 = self.spawn(1)
+        marker, _ = self.poison(w1)
+        p = self.spawn_rc(2)
+        out = p.stdout + p.stderr
+        self.assertIn("spawn refused: git config in", out)
+        self.assertNotIn("pooled worktree", out)
+        self.assertFalse(marker.exists())
 
 
 for _n in [n for n in dir(CleanTests) if n.startswith("test_") and n not in CleanPoolTests.__dict__]:

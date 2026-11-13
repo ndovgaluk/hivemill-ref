@@ -9493,6 +9493,40 @@ def _pool_reuse_on(con):
     return cfg(con, "worktree_reuse") == "1" and cfg(con, "task_clones") != "1"
 
 
+def _pool_poisoned_note(con, repo, project_id):
+    """Names pooled worktrees of `project_id` whose admin dir holds config.worktree. Filesystem reads only: it runs
+    after a git config refusal, so no git command may run in the repo."""
+    try:
+        if not stat.S_ISDIR(os.lstat(os.path.join(repo, ".git")).st_mode):
+            return ""
+        adm_root = os.path.join(repo, ".git", "worktrees")
+        if not stat.S_ISDIR(os.lstat(adm_root).st_mode):
+            return ""
+        names = sorted(os.listdir(adm_root))
+    except OSError:
+        return ""
+    note = ""
+    for row in con.execute("SELECT path, state FROM worktree_pool WHERE project_id=? ORDER BY path", (project_id,)).fetchall():
+        for name in names:
+            adm = os.path.join(adm_root, name)
+            try:
+                if not stat.S_ISDIR(os.lstat(adm).st_mode):
+                    continue
+                fd = os.open(os.path.join(adm, "gitdir"), os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    raw = os.read(fd, 4096)
+                finally:
+                    os.close(fd)
+                back = raw.decode("utf-8").rstrip("\n")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if back == f"{row['path']}/.git" and os.path.lexists(os.path.join(adm, "config.worktree")):
+                note += (f"; pooled worktree {row['path']} ({row['state']}) has {adm}/config.worktree: move that file out of "
+                         "the repository (keep it to find out who wrote it), then run the spawn again; "
+                         'see docs/worktree-reuse.md "Poisoned pooled worktree"')
+    return note
+
+
 def prepare_worktree(con, task, role):
     """Coder gets a fresh worktree on factory/<task> from origin/<base>; QA/reviewer reuse it read-only."""
     if not task:
@@ -9502,6 +9536,10 @@ def prepare_worktree(con, task, role):
     if not t or not t["repo_path"]:
         return None
     reuse_on = role == "coder" and _pool_reuse_on(con)
+
+    def poisoned_note():
+        pr = con.execute("SELECT project_id FROM goals WHERE id=?", (t["goal_id"],)).fetchone()
+        return _pool_poisoned_note(con, t["repo_path"], pr[0]) if pr and pr[0] else ""
     if reuse_on and t["worktree"] and Path(t["worktree"]).exists() and t["branch"] and con.execute(
             "SELECT 1 FROM worktree_pool WHERE path=? AND task_id=? AND state='claimed' AND reset_ok=0",
             (str(t["worktree"]), task)).fetchone():
@@ -9509,7 +9547,7 @@ def prepare_worktree(con, task, role):
         repo, base = t["repo_path"], t["base_branch"] or "main"
         if not git_config_guard(con, repo):
             con.commit()
-            die(f"spawn refused: git config in {repo} would run code: {', '.join(git_config_refusal(repo))}", 4)
+            die(f"spawn refused: git config in {repo} would run code: {', '.join(git_config_refusal(repo))}{poisoned_note()}", 4)
         git_run(repo, "fetch", "-q", "origin", text=False)
         has_remote = git_run(repo, "rev-parse", "--verify", "-q", f"origin/{base}", text=False).returncode == 0
         ok, step, err = _pool_reset(con, repo, t["worktree"], t["branch"], f"origin/{base}" if has_remote else base)
@@ -9530,7 +9568,7 @@ def prepare_worktree(con, task, role):
         if role == "coder" and t["branch"]:
             if not git_config_guard(con, t["worktree"]):
                 con.commit()
-                die(f"spawn refused: git config in {t['worktree']} would run code: {', '.join(git_config_refusal(t['worktree']))}", 4)
+                die(f"spawn refused: git config in {t['worktree']} would run code: {', '.join(git_config_refusal(t['worktree']))}{poisoned_note()}", 4)
             git_run(t["worktree"], "switch", "-q", t["branch"], text=False)
         install_pre_push_hook(t["worktree"])
         return t["worktree"]
@@ -9539,7 +9577,7 @@ def prepare_worktree(con, task, role):
     repo, base = t["repo_path"], t["base_branch"] or "main"
     if not git_config_guard(con, repo):  # worktree add checks out and runs smudge filters
         con.commit()
-        die(f"spawn refused: git config in {repo} would run code: {', '.join(git_config_refusal(repo))}", 4)
+        die(f"spawn refused: git config in {repo} would run code: {', '.join(git_config_refusal(repo))}{poisoned_note()}", 4)
     wt = WORKTREES / f"{t['goal_id']}-{task}"
     branch = t["branch"] or f"factory/{task.lower()}"
     git_run(repo, "fetch", "-q", "origin", text=False)
@@ -12723,6 +12761,8 @@ def _clean_pool_release(con, repo, base, t, wt, project_id, cap, has_branch, dry
     if admin is None:
         _clean_pool_alert(con, wt, why, dry_run)
         return "skip", "kept: gitdir mismatch"
+    if os.path.lexists(os.path.join(admin, "config.worktree")):  # lexists: file, symlink or dir all count
+        return "skip", "kept: has config.worktree"
     if _clean_pool_poolable(repo, wt):
         return None
     if dry_run:
@@ -12805,6 +12845,9 @@ def _clean_pool_sweep(con, rows, repos, panes, pane_cwds, listed, dry_run, reuse
         if admin is None:
             _clean_pool_alert(con, wt, why, dry_run)
             row["reason"] = "kept: gitdir mismatch"
+            continue
+        if os.path.lexists(os.path.join(admin, "config.worktree")):
+            row["reason"] = "kept: has config.worktree"
             continue
         why = _clean_pool_dir_problem(repo, wt, base) or protected_by(con, _real(wt), panes, listed)
         if why:

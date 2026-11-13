@@ -1,4 +1,7 @@
+import hashlib
+import subprocess
 import unittest
+from pathlib import Path
 
 from harness import FactoryTestCase, git
 
@@ -496,6 +499,319 @@ class CleanTests(FactoryTestCase):
         self.list_agents(("zz-test-c2", "p7"), ("zz-test-other", "p1"))
         self.assertIn("agent live", self.clean("--dry-run").stdout)
         self.assertTrue(wt.exists())
+
+
+class CleanPoolTests(CleanTests):
+    """G-002 B: `factory clean` with worktree_reuse pools merged worktrees, trims to worktree_pool_max, never removes a claim."""
+
+    def cfg(self, reuse="1", pool_max="2"):
+        for k, v in (("worktree_reuse", reuse), ("worktree_pool_max", pool_max)):
+            self.env.sql("INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, v))
+
+    def rows(self):
+        return self.env.sql("SELECT * FROM worktree_pool ORDER BY path")
+
+    def events(self, action):
+        return self.env.sql("SELECT detail FROM events WHERE action=?", (action,))
+
+    def wts(self):
+        return self.env.home_dir / "worktrees"
+
+    def pool_wt(self, name, state="free", task=None, released="2026-01-01T00:00:00+00:00", project="zz-test-proj", repo=None):
+        """A real detached linked worktree at origin/main under worktrees/, with a worktree_pool row."""
+        repo = repo or self.repo
+        wt = self.wts().resolve() / name
+        git("worktree", "add", "-q", "--detach", str(wt), "origin/main", cwd=repo)
+        self.env.sql("INSERT INTO worktree_pool(path,project_id,state,task_id,reset_ok,claimed_at,released_at) VALUES(?,?,?,?,1,?,?)",
+                     (str(wt), project, state, task, None if state == "free" else released, released))
+        return wt
+
+    def snap(self, wt):
+        admin = Path(git("rev-parse", "--absolute-git-dir", cwd=wt))
+        return {n: hashlib.sha256((admin / n).read_bytes()).hexdigest() for n in ("HEAD", "index") if (admin / n).exists()}
+
+    def norm(self, out, *wts):
+        out = out.replace(str(self.env.home_dir), "<HOME>")
+        return "\n".join(" ".join(l.split()) for l in out.splitlines())
+
+    def symbolic_rc(self, wt):
+        return subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=wt, capture_output=True, text=True).returncode
+
+    # 1 flag off: today's output, pinned
+    def test_flag_off_output_pinned(self):
+        wt, _, _ = self.task()
+        out = self.norm(self.clean("--dry-run").stdout)
+        self.assertEqual(out, "\n".join([
+            "TASK WORKTREE BRANCH ACTION REASON",
+            "T-0001 <HOME>/worktrees/G-001-T-0001 factory/t-0001 would remove merged and clean",
+            "total: 0 removed, 1 would remove, 0 skipped, 0 orphan(s), 0 sandbox dir(s) kept [dry run]"]))
+        out = self.norm(self.clean().stdout)
+        self.assertEqual(out, "\n".join([
+            "TASK WORKTREE BRANCH ACTION REASON",
+            "T-0001 <HOME>/worktrees/G-001-T-0001 factory/t-0001 removed merged and clean",
+            "total: 1 removed, 0 would remove, 0 skipped, 0 orphan(s), 0 sandbox dir(s) kept"]))
+        self.assertEqual(self.rows(), [])
+
+    def test_flag_off_unpushed_pinned(self):
+        wt, _, _ = self.task()
+        (wt / "extra").write_text("more\n")
+        git("add", "extra", cwd=wt)
+        git("commit", "-q", "-m", "local only", cwd=wt)
+        out = self.norm(self.clean().stdout)
+        self.assertEqual(out, "\n".join([
+            "TASK WORKTREE BRANCH ACTION REASON",
+            "T-0001 <HOME>/worktrees/G-001-T-0001 factory/t-0001 skip unpushed commits",
+            "total: 0 removed, 0 would remove, 1 skipped, 0 orphan(s), 0 sandbox dir(s) kept"]))
+        self.assertEqual(self.rows(), [])
+
+    # 2 flag off never touches the pool helper
+    def test_flag_off_ignores_forged_gitdir(self):
+        a, _, _ = self.task(1)
+        s, _, _ = self.task(2, status="in_progress", pr_state=None)
+        (a / "stray").write_text("x\n")
+        admin_s = Path(git("rev-parse", "--absolute-git-dir", cwd=s))
+        (a / ".git").write_text(f"gitdir: {admin_s}\n")
+        p = self.clean()
+        self.assertNotIn("gitdir mismatch", p.stdout)
+        self.assertEqual(self.events("worktree-gitdir-mismatch"), [])
+        self.assertEqual(self.rows(), [])
+        self.assertTrue(s.exists())
+
+    # 3 release
+    def test_release_to_pool(self):
+        self.cfg()
+        wt, branch, _ = self.task()
+        (wt / ".gitignore").write_text("node_modules/\n")
+        git("add", ".gitignore", cwd=wt)
+        git("commit", "-q", "-m", "ignore", cwd=wt)
+        git("push", "-q", "origin", branch, cwd=wt)
+        sha = git("rev-parse", "HEAD", cwd=wt)
+        self.env.seed_pr(URL1, sha=sha, state="MERGED")
+        (wt / "node_modules").mkdir()
+        (wt / "node_modules" / "x").write_text("cache\n")
+        p = self.clean()
+        self.assertIn("pooled", p.stdout)
+        self.assertIn("released to pool", p.stdout)
+        self.assertIn(", 1 pooled", p.stdout)
+        self.assertTrue(wt.exists())
+        self.assertEqual(self.symbolic_rc(wt), 1)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=wt), git("rev-parse", "origin/main", cwd=self.repo))
+        self.assertEqual(self.branches(), "")
+        self.assertIsNone(self.env.sql("SELECT worktree FROM tasks WHERE id='T-0001'")[0]["worktree"])
+        rows = self.rows()
+        self.assertEqual([(r["path"], r["state"], r["task_id"]) for r in rows], [(str(wt.resolve()), "free", None)])
+        self.assertEqual(len(self.events("worktree-pooled")), 1)
+        self.assertTrue((wt / "node_modules" / "x").exists())
+        self.assertNotIn("orphan (left alone)", p.stdout)  # 10: a pooled dir is known
+
+    # 4 cap, per project
+    def test_cap_and_per_project(self):
+        self.cfg(pool_max="2")
+        wts = [self.task(n, url=f"https://github.com/zz-test/repo/pull/{n}")[0] for n in range(1, 5)]
+        origin2, repo2 = self.env.home / "origin2.git", self.env.home / "repo2"
+        git("init", "-q", "--bare", "-b", "main", str(origin2), cwd=self.env.home)
+        git("clone", "-q", str(origin2), str(repo2), cwd=self.env.home)
+        git("checkout", "-q", "-b", "main", cwd=repo2)
+        (repo2 / "R").write_text("y\n")
+        git("add", "R", cwd=repo2)
+        git("commit", "-q", "-m", "init", cwd=repo2)
+        git("push", "-q", "-u", "origin", "main", cwd=repo2)
+        self.env.seed_project("zz-proj2")
+        self.env.sql("UPDATE projects SET repo_path=? WHERE id='zz-proj2'", (str(repo2),))
+        self.env.seed_goal("G-002", project="zz-proj2")
+        other = []
+        for n in (5, 6, 7):
+            wt = self.wts() / f"G-002-T-000{n}"
+            git("worktree", "add", "-q", "-b", f"factory/t-000{n}", str(wt), "origin/main", cwd=repo2)
+            url = f"https://github.com/zz-test/repo/pull/{n}"
+            self.env.seed_task(f"T-000{n}", goal="G-002", status="done", pr_url=url)
+            self.env.sql("UPDATE tasks SET worktree=?, branch=? WHERE id=?", (str(wt), f"factory/t-000{n}", f"T-000{n}"))
+            self.env.seed_pr(url, sha=git("rev-parse", "HEAD", cwd=wt), state="MERGED")
+            other.append(wt)
+        p = self.clean()
+        by = {}
+        for r in self.rows():
+            by.setdefault(r["project_id"], []).append(r["path"])
+        self.assertEqual({k: len(v) for k, v in by.items()}, {"zz-test-proj": 2, "zz-proj2": 2})
+        self.assertEqual(sum(w.exists() for w in wts), 2)
+        self.assertEqual(sum(w.exists() for w in other), 2)
+        self.assertEqual(len(git("worktree", "list", cwd=self.repo).splitlines()), 3)
+        self.assertIn(", 4 pooled", p.stdout)
+        self.assertEqual(sum(1 for l in p.stdout.splitlines() if " ".join(l.split()).endswith("removed merged and clean")), 3)
+
+    def test_cap_zero_removes_all(self):
+        self.cfg(pool_max="0")
+        wt, _, _ = self.task()
+        p = self.clean()
+        self.assertFalse(wt.exists())
+        self.assertIn("1 removed", p.stdout)
+        self.assertNotIn("pooled", p.stdout)
+        self.assertEqual(self.rows(), [])
+
+    # 5 claimed never removed, oldest free trimmed first
+    def test_claimed_never_removed_and_oldest_trimmed(self):
+        self.cfg(pool_max="1")
+        f = [self.pool_wt(f"pool-f{i}", released=f"2026-01-0{i}T00:00:00+00:00") for i in (1, 2, 3)]
+        c = []
+        for i in (1, 2):
+            self.env.seed_task(f"T-009{i}", status="in_progress", pr_url=None)
+            wt = self.pool_wt(f"pool-c{i}", state="claimed", task=f"T-009{i}")
+            self.env.sql("UPDATE tasks SET worktree=? WHERE id=?", (str(wt), f"T-009{i}"))
+            c.append(wt)
+        before = [self.snap(w) for w in c]
+        p = self.clean()
+        self.assertEqual([self.snap(w) for w in c], before)
+        self.assertTrue(all(w.exists() for w in c))
+        self.assertEqual([r["state"] for r in self.rows() if r["state"] == "claimed"], ["claimed", "claimed"])
+        free = [r["path"] for r in self.rows() if r["state"] == "free"]
+        self.assertEqual(free, [str(f[2])])
+        self.assertFalse(f[0].exists() or f[1].exists())
+        self.assertEqual(len(self.events("worktree-pool-trimmed")), 2)
+        self.assertEqual(p.stdout.count("pool over cap"), 2)
+
+    # 6 safety refusals stay
+    def test_safety_refusals_not_pooled(self):
+        self.cfg()
+        wt, _, _ = self.task(1)
+        (wt / "stray").write_text("x\n")
+        wt2, _, _ = self.task(2, url=URL2)
+        (wt2 / "extra").write_text("more\n")
+        git("add", "extra", cwd=wt2)
+        git("commit", "-q", "-m", "local only", cwd=wt2)
+        p = self.clean()
+        self.assertIn("untracked files: stray", p.stdout)
+        self.assertIn("unpushed commits", p.stdout)
+        self.assertEqual(self.rows(), [])
+        wt3, _, _ = self.task(3, url="https://github.com/zz-test/repo/pull/3")
+        self.pane_at("p1", wt3)
+        p = self.clean()
+        self.assertIn("protected: cwd of a live pane", p.stdout)
+        self.assertEqual(self.rows(), [])
+        self.assertTrue(wt.exists() and wt2.exists() and wt3.exists())
+
+    # 7 forged / symlinked pool rows
+    def test_forged_and_symlinked_pool_rows_kept(self):
+        self.cfg(pool_max="0")
+        self.env.seed_task("T-0050", status="in_progress", pr_url=None)
+        s = self.pool_wt("sibling", state="claimed", task="T-0050")
+        self.env.sql("UPDATE tasks SET worktree=? WHERE id='T-0050'", (str(s),))
+        admin_s = Path(git("rev-parse", "--absolute-git-dir", cwd=s))
+        link = self.wts().resolve() / "linked"
+        link.symlink_to(s)
+        forged = self.wts().resolve() / "forged"
+        forged.mkdir()
+        (forged / ".git").write_text(f"gitdir: {admin_s}\n")
+        for p_ in (link, forged):
+            self.env.sql("INSERT INTO worktree_pool(path,project_id,state,task_id,reset_ok,claimed_at,released_at) "
+                         "VALUES(?,?,'free',NULL,0,NULL,'2026-01-01T00:00:00+00:00')", (str(p_), "zz-test-proj"))
+        before = self.snap(s)
+        p = self.clean()
+        self.assertEqual(p.stdout.count("kept: gitdir mismatch"), 2)
+        self.assertTrue(s.exists())
+        self.assertEqual(self.snap(s), before)
+        self.assertEqual(len(self.events("worktree-gitdir-mismatch")), 2)
+        msgs = lambda: self.env.sql("SELECT count(*) c FROM messages WHERE subject LIKE 'worktree gitdir mismatch%'")[0]["c"]
+        self.assertEqual(msgs(), 2)
+        self.clean()
+        self.clean("--dry-run")
+        self.assertEqual(len(self.events("worktree-gitdir-mismatch")), 2)
+        self.assertEqual(msgs(), 2)
+        self.assertEqual(self.snap(s), before)
+        self.assertEqual(len(self.rows()), 3)
+
+    # 8 stale claims
+    def test_stale_claims(self):
+        self.cfg(pool_max="5")
+        self.env.seed_task("T-0060", status="done", pr_url=None)
+        clean_wt = self.pool_wt("stale-clean", state="claimed", task="T-0060")
+        self.env.seed_task("T-0061", status="done", pr_url=None)
+        dirty = self.pool_wt("stale-dirty", state="claimed", task="T-0061")
+        (dirty / "README").write_text("edited\n")
+        self.env.seed_task("T-0062", status="cancelled", pr_url=None)
+        gone = self.pool_wt("stale-gone", state="claimed", task="T-0062")
+        git("worktree", "remove", "--force", str(gone), cwd=self.repo)
+        self.env.seed_task("T-0063", status="in_progress", pr_url=None)
+        active = self.pool_wt("active", state="claimed", task="T-0063")
+        self.env.sql("UPDATE tasks SET worktree=? WHERE id='T-0063'", (str(active),))
+        before = self.snap(active)
+        p = self.clean()
+        st = {r["path"]: r for r in self.rows()}
+        self.assertEqual(st[str(clean_wt)]["state"], "free")
+        self.assertIsNone(st[str(clean_wt)]["task_id"])
+        self.assertEqual(st[str(dirty)]["state"], "claimed")
+        self.assertTrue(dirty.exists())
+        self.assertNotIn(str(gone), st)
+        self.assertIn("stale claim, dir gone", p.stdout)
+        self.assertIn("dirty", p.stdout)
+        self.assertEqual(st[str(active)]["state"], "claimed")
+        self.assertEqual(self.snap(active), before)
+
+    def test_stale_claim_trimmed_under_cap(self):
+        self.cfg(pool_max="0")
+        self.env.seed_task("T-0060", status="done", pr_url=None)
+        wt = self.pool_wt("stale-clean", state="claimed", task="T-0060")
+        self.clean()
+        self.assertFalse(wt.exists())
+        self.assertEqual(self.rows(), [])
+
+    # 9 dry run
+    def test_dry_run_changes_nothing(self):
+        self.cfg(pool_max="2")
+        wts = [self.task(n, url=f"https://github.com/zz-test/repo/pull/{n}")[0] for n in range(1, 4)]
+        old = self.pool_wt("old-free")
+        self.cfg(pool_max="2")
+        self.env.sql("UPDATE worktree_pool SET released_at='2025-01-01T00:00:00+00:00'")
+        tasks_before = self.env.sql("SELECT id, worktree, branch, status FROM tasks ORDER BY id")
+        rows_before = [tuple(r) for r in self.rows()]
+        ev = self.env.sql("SELECT count(*) c FROM events")[0]["c"]
+        msg = self.env.sql("SELECT count(*) c FROM messages")[0]["c"]
+        p = self.clean("--dry-run")
+        self.assertIn("would pool", p.stdout)
+        self.assertIn("would remove", p.stdout)
+        self.assertEqual([tuple(r) for r in self.rows()], rows_before)
+        self.assertEqual(self.env.sql("SELECT id, worktree, branch, status FROM tasks ORDER BY id"), tasks_before)
+        self.assertTrue(all(w.exists() for w in wts) and old.exists())
+        self.assertEqual(len(self.branches().splitlines()), 3)
+        self.assertEqual(self.env.sql("SELECT count(*) c FROM events")[0]["c"], ev)
+        self.assertEqual(self.env.sql("SELECT count(*) c FROM messages")[0]["c"], msg)
+        self.assertIn("1 pooled", p.stdout)
+        self.assertIn("[dry run]", p.stdout)
+
+    # 12 clones are never pooled
+    def test_clone_removed_not_pooled(self):
+        self.cfg()
+        e = self.env
+        wt, branch = self.wts() / "G-001-T-0001", "factory/t-0001"
+        git("-c", "protocol.file.allow=always", "clone", "-q", "--shared", "--no-checkout", str(self.repo), str(wt), cwd=e.home)
+        git("remote", "set-url", "origin", str(self.origin), cwd=wt)
+        git("fetch", "-q", "origin", cwd=wt)
+        git("checkout", "-q", "-b", branch, "origin/main", cwd=wt)
+        sha = git("rev-parse", "HEAD", cwd=wt)
+        e.seed_task("T-0001", status="done", pr_url=URL1)
+        e.sql("UPDATE tasks SET worktree=?, branch=? WHERE id='T-0001'", (str(wt), branch))
+        e.seed_pr(URL1, sha=sha, state="MERGED")
+        p = self.clean()
+        self.assertFalse(wt.exists())
+        self.assertIn("1 removed", p.stdout)
+        self.assertEqual(self.rows(), [])
+
+    def test_claimed_row_of_released_task_turns_free(self):
+        self.cfg()
+        wt, branch, sha = self.task()
+        self.env.sql("INSERT INTO worktree_pool(path,project_id,state,task_id,reset_ok,claimed_at,released_at) "
+                     "VALUES(?,?,'claimed','T-0001',1,'2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00')", (str(wt.resolve()), "zz-test-proj"))
+        self.clean()
+        r = self.rows()
+        self.assertEqual([(x["state"], x["task_id"]) for x in r], [("free", None)])
+        self.cfg(pool_max="0")
+        self.clean()
+        self.assertFalse(wt.exists())
+        self.assertEqual(self.rows(), [])
+
+
+# CleanPoolTests reuses CleanTests' fixtures only: hide the inherited test_* methods (the loader skips non-callables)
+for _n in [n for n in dir(CleanTests) if n.startswith("test_") and n not in CleanPoolTests.__dict__]:
+    setattr(CleanPoolTests, _n, None)
 
 
 if __name__ == "__main__":

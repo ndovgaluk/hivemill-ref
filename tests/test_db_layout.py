@@ -35,6 +35,8 @@ def fill_every_table(path):
         vals = ["1" if (c[2].upper() in ("INTEGER", "REAL")) else "zz-legacy" for c in cols
                 if not (c[5] and c[2].upper() == "INTEGER")]
         con.execute(f'INSERT OR IGNORE INTO "{t}"({",".join(names)}) VALUES({",".join("?" * len(names))})', vals)
+    con.execute("INSERT OR IGNORE INTO worktree_pool(path, project_id, state, released_at) "  # CHECKed columns: the generic fill is ignored
+                "VALUES('/zz-legacy', 'zz-legacy', 'free', 'zz-legacy')")
     con.commit()
     con.close()
 
@@ -393,6 +395,128 @@ class GuardLayoutTests(ReadsBase):
         os.environ["FACTORY_DB"] = elsewhere
         self.addCleanup(os.environ.pop, "FACTORY_DB", None)
         self.blocked(f"factory goal show {OWN}")  # FACTORY_DB does not point the hook at another DB
+
+
+POOL_OBJECTS = "SELECT type, name, sql FROM sqlite_master WHERE tbl_name='worktree_pool' ORDER BY type, name"
+
+
+class WorktreePoolTable(FactoryTestCase):
+    """G-002: the worktree_pool table, its migration and the DB-only claim functions."""
+
+    def con(self):
+        con = sqlite3.connect(self.env.db_path, isolation_level=None, timeout=30)
+        con.execute("PRAGMA busy_timeout=30000")
+        return con
+
+    def insert(self, con, path, state, task_id):
+        con.execute("INSERT INTO worktree_pool(path, project_id, state, task_id, released_at) VALUES(?,?,?,?,?)",
+                    (path, "p1", state, task_id, "2026-01-01T00:00:00+00:00"))
+
+    def test_constraints(self):
+        con = self.con()
+        self.insert(con, "/w/a", "free", None)
+        self.insert(con, "/w/b", "claimed", "T-1")
+        for args in (("/w/c", "claimed", None), ("/w/d", "free", "T-9"), ("/w/e", "busy", None),
+                     ("/w/f", "claimed", "T-1"), ("/w/a", "free", None)):
+            with self.assertRaises(sqlite3.IntegrityError, msg=args):
+                self.insert(con, *args)
+        self.assertEqual(con.execute("SELECT count(*) FROM worktree_pool").fetchone()[0], 2)
+        self.insert(con, "/w/g", "free", None)  # free rows have no task_id, so the claimed-only unique index allows many
+        con.close()
+
+    def test_migration_adds_table_and_is_idempotent(self):
+        con = self.con()
+        want = con.execute(POOL_OBJECTS).fetchall()
+        self.assertEqual({r[1] for r in want}, {"worktree_pool", "worktree_pool_task", "worktree_pool_proj"}
+                         | {r[1] for r in want if r[1].startswith("sqlite_autoindex")})
+        con.execute("DROP TABLE worktree_pool")  # an older DB: the table and its indexes are gone
+        self.assertEqual(con.execute(POOL_OBJECTS).fetchall(), [])
+        con.close()
+        self.ok("config", "worktree_pool_max")  # any command opens the DB through migrate()
+        con = self.con()
+        first = con.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").fetchall()
+        self.assertEqual(con.execute(POOL_OBJECTS).fetchall(), want)
+        con.close()
+        self.ok("config", "worktree_pool_max")
+        con = self.con()
+        self.assertEqual(con.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").fetchall(), first)
+        con.close()
+
+    def test_claim_waits_for_a_held_write_lock_then_finds_nothing(self):
+        with self.env.load_factory() as mod:
+            c1, c2 = self.con(), self.con()
+            mod.pool_free(c1, "/w/a", "p1")
+            c1.execute("BEGIN IMMEDIATE")  # connection 1 is mid-claim
+            c1.execute("UPDATE worktree_pool SET state='claimed', task_id='T-1' WHERE path='/w/a'")
+            c2.execute("PRAGMA busy_timeout=100")
+            with self.assertRaises(sqlite3.OperationalError):
+                mod.pool_claim(c2, "p1", "T-2")  # cannot even begin while connection 1 holds the write lock
+            got = []
+            c2.close()
+
+            def other():
+                c = self.con()
+                try:
+                    got.append(mod.pool_claim(c, "p1", "T-2"))
+                finally:
+                    c.close()
+
+            t = threading.Thread(target=other)
+            t.start()
+            c1.execute("COMMIT")
+            t.join(30)
+            self.assertEqual(got, [None])
+            rows = c1.execute("SELECT path, state, task_id FROM worktree_pool").fetchall()
+            self.assertEqual(rows, [("/w/a", "claimed", "T-1")])
+            c1.close()
+
+    def test_two_free_rows_give_distinct_paths_and_other_projects_are_left_alone(self):
+        with self.env.load_factory() as mod:
+            con = self.con()
+            mod.pool_free(con, "/w/a", "p1")
+            mod.pool_free(con, "/w/b", "p1")
+            mod.pool_free(con, "/w/other", "p2")
+            got = {mod.pool_claim(con, "p1", "T-1"), mod.pool_claim(con, "p1", "T-2")}
+            self.assertEqual(got, {"/w/a", "/w/b"})
+            self.assertIsNone(mod.pool_claim(con, "p1", "T-3"))
+            self.assertEqual(mod.pool_free_count(con, "p1"), 0)
+            self.assertEqual(mod.pool_free_count(con, "p2"), 1)
+            mod.pool_release_claim(con, "/w/a")
+            self.assertEqual(con.execute("SELECT count(*) FROM worktree_pool").fetchone()[0], 2)
+            con.close()
+
+    def test_claim_stress_twenty_threads_seven_rows(self):
+        n, k = 20, 7
+        with self.env.load_factory() as mod:
+            con = self.con()
+            for i in range(k):
+                mod.pool_free(con, f"/w/{i}", "p1")
+            gate = threading.Barrier(n)
+            results = [None] * n
+            errors = []
+
+            def claim(i):
+                c = self.con()
+                try:
+                    gate.wait(30)
+                    results[i] = mod.pool_claim(c, "p1", f"T-{i}")
+                except Exception as e:  # reported below, never swallowed
+                    errors.append(repr(e))
+                finally:
+                    c.close()
+
+            threads = [threading.Thread(target=claim, args=(i,)) for i in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(120)
+            self.assertEqual(errors, [])
+            won = [r for r in results if r is not None]
+            self.assertEqual(len(won), k)
+            self.assertEqual(len(set(won)), k)
+            self.assertEqual(con.execute("SELECT count(*) FROM worktree_pool WHERE state='claimed'").fetchone()[0], k)
+            self.assertEqual(con.execute("SELECT count(DISTINCT task_id) FROM worktree_pool WHERE state='claimed'").fetchone()[0], k)
+            con.close()
 
 
 if __name__ == "__main__":

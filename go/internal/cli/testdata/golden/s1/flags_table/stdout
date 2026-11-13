@@ -33,3 +33,4 @@ test_sandbox_subuid   off     0          0
 tick_async_start      off     0          0                                           
 tick_phase_timers     off     0          0                                           
 worker_gh_roles       off                           G-010                            
+worktree_reuse        off     0          0          G-002  docs/worktree-reuse.md    

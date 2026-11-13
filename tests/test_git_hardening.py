@@ -1,8 +1,11 @@
+import hashlib
 import json
+import os
 import shutil
 import subprocess
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from harness import FactoryTestCase, git
 
@@ -505,6 +508,242 @@ class TickGitHardeningTests(FactoryTestCase):
     def test_clean_repo_no_refusal_event(self):
         self.ok("tick")
         self.assertEqual(self.refused_events(), [])
+
+
+class WorktreeOwnershipTests(FactoryTestCase):
+    """G-002: worktree_owns_gitdir / _wt_git / _wt_remove accept a real linked worktree under <home>/worktrees and
+    refuse everything else without running git inside it; a sibling worktree S is never touched."""
+
+    def setUp(self):
+        super().setUp()
+        e = self.env
+        self.repo = e.home / "repo"
+        self.repo.mkdir()
+        git("init", "-q", "-b", "main", str(self.repo), cwd=e.home)
+        git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "base", cwd=self.repo)
+        self.wts = e.home_dir / "worktrees"
+        self.wts.mkdir()
+        self.common = self.repo / ".git"
+        self.A, self.S = self.add("A"), self.add("S")
+        self.sibling_before = self.sibling_state()
+        cm = e.load_factory()
+        self.mod = cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+
+    def add(self, name, parent=None):
+        path = (parent or self.wts) / name
+        git("worktree", "add", "-q", "-b", f"b-{name}", str(path), cwd=self.repo)
+        return path
+
+    def sibling_state(self):
+        adm = self.common / "worktrees" / "S"
+        return [hashlib.sha256((adm / f).read_bytes()).hexdigest() for f in ("index", "HEAD")]
+
+    def assert_sibling_intact(self):
+        self.assertTrue(self.S.is_dir())
+        self.assertEqual(self.sibling_state(), self.sibling_before)
+
+    def refuse(self, wt):
+        """Every refusal: rc 126 from _wt_git and _wt_remove AND no git call with cwd under wt or naming wt
+        (only `worktree list --porcelain` run in the repo is allowed)."""
+        self.shim_git()
+        start = len(self.calls())
+        admin, why = self.mod.worktree_owns_gitdir(self.repo, wt)
+        self.assertIsNone(admin, why)
+        self.assertTrue(why)
+        rc, _, err = self.mod._wt_git(self.repo, wt, "status")
+        self.assertEqual(rc, 126, err)
+        rc, _, err = self.mod._wt_remove(self.repo, wt)
+        self.assertEqual(rc, 126, err)
+        self.assert_no_git_call_on(wt, self.calls()[start:])
+        self.assert_sibling_intact()
+        return why
+
+    def assert_no_git_call_on(self, wt, lines):
+        # Whitelist: the shim logs the physical $PWD, so compare the logical and the resolved worktree
+        # path. On a refusal the only allowed call is `worktree list --porcelain` run in the repo.
+        w = str(wt)
+        rw = os.path.realpath(w)
+        rr = os.path.realpath(self.repo)
+        for line in lines:
+            cwd, argv = line.split("\t", 1)
+            self.assertNotIn(cwd, {w, rw}, line)
+            self.assertFalse(cwd.startswith(w + os.sep) or cwd.startswith(rw + os.sep), line)
+            self.assertNotIn(w, argv, line)
+            self.assertNotIn(rw, argv, line)
+            # the only allowed call: git -C <repo> ... worktree list --porcelain (its $PWD is the caller's, not the repo's)
+            toks = argv.split()
+            self.assertEqual(toks[0], "-C", line)
+            self.assertIn(toks[1], {str(self.repo), rr}, line)
+            self.assertTrue(argv.endswith(" worktree list --porcelain"), line)
+
+    def admin(self, name="A"):
+        return self.common / "worktrees" / name
+
+    # -- accepted ---------------------------------------------------------
+    def test_real_worktree_accepted(self):
+        admin, why = self.mod.worktree_owns_gitdir(self.repo, self.A)
+        self.assertEqual((admin, why), (self.admin(), ""))
+
+    def test_relative_pointers_accepted(self):
+        r = self.add("R")
+        (r / ".git").write_text("gitdir: ../../../repo/.git/worktrees/R\n")
+        (self.admin("R") / "gitdir").write_text("../../../../factory/worktrees/R/.git\n")
+        admin, why = self.mod.worktree_owns_gitdir(self.repo, r)
+        self.assertEqual((admin, why), (self.admin("R"), ""))
+
+    # -- refused ----------------------------------------------------------
+    def test_a_symlink_to_sibling(self):
+        (self.wts / "L").symlink_to(self.S)
+        self.refuse(self.wts / "L")
+
+    def test_b_symlinked_parent(self):
+        (self.wts / "P").symlink_to(self.wts)
+        self.refuse(self.wts / "P" / "S")
+
+    def test_c_dotgit_symlink(self):
+        c = self.wts / "C"
+        c.mkdir()
+        (c / ".git").symlink_to(self.S / ".git")
+        self.refuse(c)
+
+    def test_d_dotgit_directory(self):
+        d = self.wts / "D"
+        (d / ".git").mkdir(parents=True)
+        self.refuse(d)
+
+    def test_e_back_pointer_names_sibling(self):
+        x = self.wts / "X"
+        x.mkdir()
+        (x / ".git").write_text(f"gitdir: {self.admin('S')}\n")
+        self.refuse(x)
+
+    def test_f_gitdir_shapes(self):
+        for text in (f"{self.common}/worktrees/../worktrees/A", f"{self.common}/worktrees/a/b",
+                     f"{self.repo}/outside", "../../../repo/.git/worktrees/../worktrees/A", f"{self.common}/worktrees/./A"):
+            with self.subTest(text=text):
+                saved = (self.A / ".git").read_text()
+                (self.A / ".git").write_text(f"gitdir: {text}\n")
+                try:
+                    self.refuse(self.A)
+                finally:
+                    (self.A / ".git").write_text(saved)
+        (self.A / ".git").write_text("gitdir: " + str(self.admin()) + "\nextra\n")
+        self.refuse(self.A)
+
+    def test_g_admin_gitdir_symlink(self):
+        back = self.admin() / "gitdir"
+        real = self.admin() / "gitdir.real"
+        back.rename(real)
+        back.symlink_to(real)
+        self.refuse(self.A)
+
+    def test_g_admin_gitdir_names_symlink_alias(self):
+        (self.wts / "alias").symlink_to(self.A)
+        (self.admin() / "gitdir").write_text(f"{self.wts}/alias/.git\n")
+        why = self.refuse(self.A)
+        self.assertIn("back pointer", why)
+        # git itself lists the alias path, which would refuse this for another reason; make it list A so that
+        # only the UNRESOLVED back-pointer compare is left to catch the alias
+        listing = (0, f"worktree {self.A}\nHEAD {'1' * 40}\ndetached", "")
+        with mock.patch.object(self.mod, "_git_rc", return_value=listing):
+            admin, why = self.mod.worktree_owns_gitdir(self.repo, self.A)
+        self.assertIsNone(admin)
+        self.assertIn("back pointer", why)
+
+    def test_h_forged_commondir(self):
+        other = self.env.home / "other"
+        other.mkdir()
+        git("init", "-q", "-b", "main", str(other), cwd=self.env.home)
+        (self.admin() / "commondir").write_text(f"{other}/.git\n")
+        self.refuse(self.A)
+
+    def test_i_hand_made_admin_not_listed(self):
+        h = self.wts / "H"
+        h.mkdir()
+        (h / ".git").write_text(f"gitdir: {self.admin('H')}\n")
+        self.admin("H").mkdir()
+        (self.admin("H") / "gitdir").write_text(f"{h}/.git\n")
+        (self.admin("H") / "commondir").write_text("../..\n")
+        self.refuse(h)
+
+    def test_j_not_a_direct_child(self):
+        nested = self.add("N", parent=self.make_dir(self.wts / "sub"))
+        self.refuse(nested)
+        elsewhere = self.add("E", parent=self.make_dir(self.env.home / "elsewhere"))
+        self.refuse(elsewhere)
+        self.refuse(self.wts)
+
+    @staticmethod
+    def make_dir(p):
+        p.mkdir()
+        return p
+
+    # -- the choke point --------------------------------------------------
+    def shim_git(self):
+        if getattr(self, "log", None):
+            return
+        real = shutil.which("git")
+        shim_dir = self.env.home / "shim"
+        shim_dir.mkdir()
+        self.log = self.env.home / "git-calls.log"
+        shim = shim_dir / "git"
+        shim.write_text(f'#!/bin/sh\nprintf \'%s\\t%s\\n\' "$PWD" "$*" >> {self.log}\nexec {real} "$@"\n')
+        shim.chmod(0o755)
+        patch = mock.patch.dict(os.environ, {"PATH": f"{shim_dir}{os.pathsep}{os.environ['PATH']}"})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def calls(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def test_refusals_make_no_git_call_naming_or_inside_the_worktree(self):
+        (self.wts / "L").symlink_to(self.S)
+        c = self.wts / "C"
+        c.mkdir()
+        (c / ".git").symlink_to(self.S / ".git")
+        x = self.wts / "X"
+        x.mkdir()
+        (x / ".git").write_text(f"gitdir: {self.admin('S')}\n")
+        h = self.wts / "H"
+        h.mkdir()
+        (h / ".git").write_text(f"gitdir: {self.admin('H')}\n")
+        self.admin("H").mkdir()
+        (self.admin("H") / "gitdir").write_text(f"{h}/.git\n")
+        (self.admin("H") / "commondir").write_text("../..\n")
+        self.shim_git()
+        # positive control: the helper is not vacuous (accepts the one allowed call, rejects each bad shape)
+        ok = f"/cwd\t-C {self.repo} -c core.hooksPath=/dev/null worktree list --porcelain"
+        self.assert_no_git_call_on(self.wts / "L", [ok])
+        for bad in (f"{self.S}\t-C {self.repo} worktree list --porcelain",
+                    f"{os.path.realpath(self.S)}/sub\t-C {self.repo} worktree list --porcelain",
+                    f"/cwd\t-C {self.repo} status",
+                    f"/cwd\t-C {os.path.realpath(self.S)} worktree list --porcelain",
+                    f"/cwd\t-C {self.repo} rev-parse HEAD"):
+            with self.assertRaises(AssertionError, msg=bad):
+                self.assert_no_git_call_on(self.wts / "L", [bad])
+        for wt in (self.wts / "L", c, x, h):
+            start = len(self.calls())
+            self.mod._wt_git(self.repo, wt, "status")
+            self.mod._wt_remove(self.repo, wt)
+            self.assert_no_git_call_on(wt, self.calls()[start:])
+        self.assert_sibling_intact()
+
+    def test_accept_passes_explicit_git_dir_and_work_tree(self):
+        self.shim_git()
+        rc, out, err = self.mod._wt_git(self.repo, self.A, "rev-parse", "--show-toplevel")
+        self.assertEqual((rc, out), (0, str(self.A)), err)
+        last = self.calls()[-1]
+        cwd, argv = last.split("\t", 1)
+        self.assertEqual(cwd, str(self.A))
+        self.assertIn(f"--git-dir={self.admin()}", argv)
+        self.assertIn(f"--work-tree={self.A}", argv)
+
+    def test_remove_accepted_worktree_leaves_sibling(self):
+        rc, _, err = self.mod._wt_remove(self.repo, self.A)
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(self.A.exists())
+        self.assert_sibling_intact()
 
 
 if __name__ == "__main__":

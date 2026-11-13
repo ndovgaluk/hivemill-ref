@@ -235,6 +235,8 @@ DEFAULT_CONFIG = {
     "serve_port": "8765",        # `factory serve`: TCP port
     "serve_hostnames": "",       # `factory serve`: extra Host names accepted besides the bind IP (comma-separated); empty = the bind IP only
     "task_clones": "0",          # 1 = a new coder task gets a standalone `git clone --shared` instead of a `git worktree add` (docs/git-hardening.md); 0 = off
+    "worktree_reuse": "0",       # 1 = a new coder task reuses a free pooled worktree of its project (docs/worktree-reuse.md); 0 = off
+    "worktree_pool_max": "2",    # max FREE pooled worktrees kept per project by `factory clean` when worktree_reuse=1 (0..50)
     "factory_remote_url": "",    # the one origin URL the git guard allows for the factory checkout; empty = learned once from the live checkout (docs/git-hardening.md)
     # reasoning effort for Opus agents (`claude --effort`, owner M2741); "" = leave Claude's default. Sonnet is never touched.
     "opus_effort": "medium",
@@ -369,6 +371,15 @@ CREATE TABLE IF NOT EXISTS util_samples (
 CREATE INDEX IF NOT EXISTS idx_util_samples_ts ON util_samples(ts);
 """
 
+WORKTREE_POOL_DDL = """
+CREATE TABLE IF NOT EXISTS worktree_pool (
+  path TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('free','claimed')),
+  task_id TEXT, reset_ok INTEGER NOT NULL DEFAULT 0, claimed_at TEXT, released_at TEXT NOT NULL,
+  CHECK((state='free' AND task_id IS NULL) OR (state='claimed' AND task_id IS NOT NULL)));
+CREATE UNIQUE INDEX IF NOT EXISTS worktree_pool_task ON worktree_pool(task_id) WHERE state='claimed';
+CREATE INDEX IF NOT EXISTS worktree_pool_proj ON worktree_pool(project_id, state, released_at);
+"""
 GATE_RUNS_DDL = """
 CREATE TABLE IF NOT EXISTS gate_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, task_id TEXT, pr_url TEXT,
@@ -438,7 +449,7 @@ CREATE TABLE IF NOT EXISTS events (
   entity_id TEXT, action TEXT NOT NULL, detail TEXT);
 CREATE INDEX IF NOT EXISTS idx_msg_rcpt ON messages(recipient, read_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_goal ON tasks(goal_id, status);
-""" + GATE_RUNS_DDL + LESSONS_DDL + REJECTION_INCIDENTS_DDL + RETRO_DDL
+""" + GATE_RUNS_DDL + LESSONS_DDL + REJECTION_INCIDENTS_DDL + RETRO_DDL + WORKTREE_POOL_DDL
 
 
 # ───────────────────────────── basics ─────────────────────────────
@@ -554,6 +565,7 @@ def migrate(con):
                     raise
     con.execute("CREATE TABLE IF NOT EXISTS throttle (key TEXT PRIMARY KEY, ts TEXT NOT NULL)")
     con.executescript(GATE_RUNS_DDL)
+    con.executescript(WORKTREE_POOL_DDL)  # G-002: pooled worktree claims
     for col in ("task_ids", "tip_sha", "tree"):  # train runs (T-0522) on a DB created before the columns existed
         if col not in {r["name"] for r in con.execute("PRAGMA table_info(gate_runs)")}:
             try:
@@ -2748,6 +2760,14 @@ def _config_value_rules(key, value):
         a.value = a.value.strip()
         if a.value not in ("0", "1"):
             die(f"task_clones must be 0 or 1, not {a.value!r}", 2)
+    if a.key == "worktree_reuse":
+        a.value = a.value.strip()
+        if a.value not in ("0", "1"):
+            die(f"worktree_reuse must be 0 or 1, not {a.value!r}", 2)
+    if a.key == "worktree_pool_max":
+        a.value = a.value.strip()
+        if not (a.value.isascii() and a.value.isdigit() and 0 <= int(a.value) <= 50):
+            die(f"worktree_pool_max must be an integer 0..50, not {a.value!r}", 2)
     if a.key == "terminal_backend":
         v = a.value.strip().lower()
         if v not in ("auto", "herdr", "hc"):
@@ -8879,6 +8899,155 @@ def git_run(repo, *args, env=None, text=True, **kw):
     _PT["git_n"] += 1  # tick phase timers: export_git counts these
     return subprocess.run(git_argv(repo, *args), capture_output=True, text=text,
                           env={**(os.environ if env is None else env), "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"}, **kw)
+
+
+# ── worktree pool (G-002): DB claim model + the one ownership check every pooled-worktree git call goes through ──
+
+def pool_claim(con, project_id, task_id):
+    """Claim the oldest free pooled worktree of `project_id` for `task_id`; its path, or None when none is free.
+    One BEGIN IMMEDIATE transaction (SQLite has one writer), UPDATE guarded by state='free', rowcount must be 1.
+    DB only: no git, no filesystem."""
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        row = con.execute("SELECT path FROM worktree_pool WHERE project_id=? AND state='free' "
+                          "ORDER BY released_at, path LIMIT 1", (project_id,)).fetchone()
+        if row is None:
+            con.execute("COMMIT")
+            return None
+        cur = con.execute("UPDATE worktree_pool SET state='claimed', task_id=?, reset_ok=0, claimed_at=? "
+                          "WHERE path=? AND state='free'", (task_id, now(), row[0]))
+        if cur.rowcount != 1:
+            raise RuntimeError(f"worktree_pool claim of {row[0]} lost a race (rowcount {cur.rowcount})")
+        con.execute("COMMIT")
+        return row[0]
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+
+
+def pool_release_claim(con, path):
+    """Drop the pool row of `path` (a failed or abandoned claim, or a removed directory)."""
+    con.execute("DELETE FROM worktree_pool WHERE path=?", (str(path),))
+
+
+def pool_free(con, path, project_id):
+    """Make `path` a free pooled worktree of `project_id` (insert or update), released now."""
+    con.execute("INSERT INTO worktree_pool(path, project_id, state, task_id, reset_ok, claimed_at, released_at) "
+                "VALUES(?,?,'free',NULL,0,NULL,?) ON CONFLICT(path) DO UPDATE SET project_id=excluded.project_id, "
+                "state='free', task_id=NULL, reset_ok=0, claimed_at=NULL, released_at=excluded.released_at",
+                (str(path), project_id, now()))
+
+
+def pool_free_count(con, project_id):
+    return con.execute("SELECT count(*) FROM worktree_pool WHERE project_id=? AND state='free'", (project_id,)).fetchone()[0]
+
+
+_GITDIR_LINE = re.compile(r"gitdir: (.+)\n?")
+
+
+def _read_small_file(path, limit=4096):
+    """Text of a regular file opened O_NOFOLLOW, at most `limit` bytes, strict utf-8; OSError/UnicodeDecodeError on anything else."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        data = os.read(fd, limit + 1)
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise OSError(f"{path} is larger than {limit} bytes")
+    return data.decode("utf-8", errors="strict")
+
+
+def _is_plain_dir(path):
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def worktree_owns_gitdir(repo, wt):
+    """Does the directory `wt` really belong to a linked worktree of `repo`? Returns (admin_dir, "") or (None, reason).
+    Reads files only (no git inside `wt`); every path from `wt` is compared as written, never resolved, except the
+    one realpath == abspath test that refuses a symlink anywhere in `wt`'s own path. Any error refuses."""
+    try:
+        w = os.path.abspath(str(wt))
+        root = os.path.realpath(str(WORKTREES))
+        if os.path.dirname(w) == os.path.abspath(str(WORKTREES)):
+            w = os.path.join(root, os.path.basename(w))  # a symlinked home is fine; the child itself is checked below
+        if os.path.dirname(w) != root or os.path.basename(w) in ("", ".", ".."):
+            return None, "not a direct child of worktrees/"
+        if os.path.realpath(w) != w:
+            return None, "path contains a symlink"
+        if not _is_plain_dir(w):
+            return None, "not a directory"
+        dotgit = os.path.join(w, ".git")
+        if not stat.S_ISREG(os.lstat(dotgit).st_mode):
+            return None, ".git is not a regular file"
+        m = _GITDIR_LINE.fullmatch(_read_small_file(dotgit))
+        if not m:
+            return None, ".git is not a single 'gitdir: <path>' line"
+        text = m.group(1)
+        parts = text.split("/")
+        if "\0" in text or "." in parts[1:] or (os.path.isabs(text) and ".." in parts):
+            return None, "gitdir has '.' or '..' components"
+        if not os.path.isabs(text) and ".." in parts[next((i for i, x in enumerate(parts) if x != ".."), len(parts)):]:
+            return None, "gitdir has '..' after a name"
+        admin = os.path.normpath(text if os.path.isabs(text) else os.path.join(w, text))
+        repo_git = os.path.join(os.path.abspath(str(repo)), ".git")
+        if not _is_plain_dir(repo_git):
+            return None, "repo has no .git directory"
+        common = os.path.realpath(repo_git)
+        wt_root = os.path.join(common, "worktrees")
+        if os.path.realpath(wt_root) != wt_root or os.path.dirname(admin) != wt_root:
+            return None, "gitdir is not a direct child of <common>/worktrees"
+        if not _is_plain_dir(admin):
+            return None, "admin dir is not a real directory"
+        if not stat.S_ISREG(os.lstat(os.path.join(admin, "HEAD")).st_mode):
+            return None, "admin dir has no regular HEAD file (hand-made, not created by git worktree add)"
+        back = _read_small_file(os.path.join(admin, "gitdir")).rstrip("\n")
+        back_abs = back if os.path.isabs(back) else os.path.normpath(os.path.join(admin, back))
+        if back_abs != dotgit:
+            return None, "admin gitdir back pointer does not name this worktree's .git"
+        cdir = _read_small_file(os.path.join(admin, "commondir")).rstrip("\n")
+        if os.path.realpath(cdir if os.path.isabs(cdir) else os.path.join(admin, cdir)) != common:
+            return None, "admin commondir is not the repo's common dir"
+        rc, out, err = _git_rc(["worktree", "list", "--porcelain"], repo=repo)
+        if rc != 0:
+            return None, f"git worktree list failed: {err or rc}"
+        entries = [e.splitlines() for e in out.split("\n\n") if e.strip()]
+        mine = [e for e in entries if e[0] == f"worktree {w}"]
+        if len(mine) != 1 or any(x == "prunable" or x.startswith("prunable ") for x in mine[0]):
+            return None, "not listed exactly once (or prunable) in git worktree list"
+        return Path(admin), ""
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        return None, f"cannot verify: {e}"
+
+
+def _wt_git(repo, wt, *args, timeout=60, env=None):
+    """git on a pooled/released worktree, only after worktree_owns_gitdir passes, always with explicit
+    --git-dir/--work-tree (git_argv adds -C <repo>; cwd is <wt>) so a planted .git or discovery can redirect nothing. (rc, stdout, stderr);
+    a refusal is rc 126 and no git runs. Never falls back to a plain git call."""
+    admin, why = worktree_owns_gitdir(repo, wt)
+    if admin is None:
+        return 126, "", f"refused: {wt} is not a worktree of {repo}: {why}"
+    w = os.path.abspath(str(wt))
+    argv = git_argv(repo, f"--git-dir={admin}", f"--work-tree={w}", *HARDENED_GIT_FLAGS, *args)
+    _PT["git_n"] += 1
+    try:
+        r = subprocess.run(argv, cwd=w, capture_output=True, text=True, timeout=timeout,
+                           env={**(os.environ if env is None else env), "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"})
+    except subprocess.TimeoutExpired:
+        return 124, "", f"git {args[0] if args else ''} timed out"
+    return r.returncode, r.stdout.strip(), (r.stderr or "").strip()
+
+
+def _wt_remove(repo, wt):
+    """Remove a pooled/released worktree: ownership check first, then `git -C repo worktree remove --force`. (rc, out, err)."""
+    admin, why = worktree_owns_gitdir(repo, wt)
+    if admin is None:
+        return 126, "", f"refused: {wt} is not a worktree of {repo}: {why}"
+    return _git_rc(["worktree", "remove", "--force", os.path.abspath(str(wt))], repo=repo)
 
 
 def gh_git_env():

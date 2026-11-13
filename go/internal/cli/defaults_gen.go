@@ -88,6 +88,8 @@ var DefaultConfig = []ConfigDefault{
 	{"serve_port", "8765"},
 	{"serve_hostnames", ""},
 	{"task_clones", "0"},
+	{"worktree_reuse", "0"},
+	{"worktree_pool_max", "2"},
 	{"factory_remote_url", ""},
 	{"opus_effort", "medium"},
 	{"judge_max_refreshes", "4"},

@@ -51,3 +51,18 @@ python3 -c "import sqlite3,sys;c=sqlite3.connect(sys.argv[1],isolation_level=Non
 ```
 
 `tests/test_db_layout.py` runs both rollback variants in a temp home.
+
+## worktree_pool (G-002)
+
+One row per pooled coder worktree directory, used when `worktree_reuse=1` (flag-off: the table stays empty and nothing reads it).
+
+| column | meaning |
+|---|---|
+| `path` (PK) | absolute worktree path, one row per directory |
+| `project_id` | the project the worktree belongs to; a task only claims rows of its own project |
+| `state` | `free` (no task) or `claimed` (`task_id` set); a CHECK ties the two together |
+| `task_id` | the claiming task; the partial unique index `worktree_pool_task` allows one claimed row per task |
+| `reset_ok` | 0 until the claim's reset to `origin/<base>` was verified |
+| `claimed_at`, `released_at` | claim time; time the row last became free |
+
+A claim is one `BEGIN IMMEDIATE` transaction (`pool_claim`), so two processes never get the same row. The table is created by `SCHEMA` and by an idempotent `CREATE ... IF NOT EXISTS` in `migrate()`. Every git call on a pooled worktree goes through `_wt_git` / `_wt_remove`, which first run `worktree_owns_gitdir` (symlink- and forged-`.git`-safe ownership check).

@@ -316,6 +316,7 @@ var ruleKeys = map[string]bool{
 	"opus_effort": true, "scout_triage_per_run": true, "model_cleaner": true, "guard_impl": true,
 	"sandbox_roles": true, "worker_gh_roles": true, "gh_rw_roles": true, "cursor_pilot_roles": true,
 	"agent_runtimes": true, "worker_gh_repos": true, "factory_remote_url": true, "task_clones": true,
+	"worktree_reuse": true, "worktree_pool_max": true,
 	"terminal_backend": true, "skilleval_root": true,
 }
 

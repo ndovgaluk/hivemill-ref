@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import threading
 import unittest
@@ -1045,6 +1046,37 @@ class WorktreeReuseSpawnTests(FactoryTestCase):
         self.assertEqual(sorted(got), sorted(pool))
         self.assertEqual(self.env.sql("SELECT count(*) c FROM worktree_pool WHERE state='claimed'")[0]["c"], 2)
         self.assertEqual(self.env.sql("SELECT task_id, count(*) c FROM worktree_pool WHERE state='claimed' GROUP BY task_id HAVING count(*)>1"), [])
+
+    def test_claim_is_exclusive_between_its_select_and_its_update(self):
+        """Deterministic race: a second connection tries to claim exactly between pool_claim's SELECT and UPDATE."""
+        P = self.pooled()
+        self.todo(2)
+        self.todo(3)
+        cm = self.env.load_factory()
+        mod = cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+        con1, con2 = mod.db(), mod.db()
+        con2.execute("PRAGMA busy_timeout=100")
+        seen = []
+
+        class Racer:
+            def __init__(self, con):
+                self.con = con
+
+            def execute(self, sql, *a):
+                r = self.con.execute(sql, *a)
+                if sql.startswith("SELECT path FROM worktree_pool") and not seen:
+                    try:
+                        seen.append(mod.pool_claim(con2, "zz-test-proj", "T-0003"))
+                    except sqlite3.OperationalError as e:
+                        seen.append(f"locked: {e}")
+                return r
+
+        got = mod.pool_claim(Racer(con1), "zz-test-proj", "T-0002")
+        self.assertEqual(got, str(P))
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0] is None or seen[0].startswith("locked"), f"second claimer got {seen[0]!r}")
+        self.assertEqual([(r["task_id"], r["state"]) for r in self.rows()], [("T-0002", "claimed")])
 
     # 9 crash recovery
     def claimed_for(self, P, reset_ok):

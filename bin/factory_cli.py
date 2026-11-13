@@ -12477,6 +12477,200 @@ def clean_sandbox_dirs(con, pane_cwds, dry_run, root=None):
     return [r for r in rows if r not in kept], len(kept)  # kept dirs are counted, not listed, so a quiet run stays quiet
 
 
+# ── worktree pool in `factory clean` (G-002): release, stale claims, trim. Every git/rm call on a pooled dir goes
+# through _wt_git/_wt_remove, so a symlinked or forged pool path can never reach a sibling worktree. ──
+
+def _clean_pool_alert(con, path, why, dry_run):
+    """Event worktree-gitdir-mismatch + one director message per path, at most once an hour (like git_config_guard); a dry run sends nothing."""
+    if dry_run:
+        return
+    key = f"last_gitdir_mismatch_ts:{path}"
+    try:
+        last = con.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
+        if last and time.time() - float(last["value"]) < 3600:
+            return
+        event(con, "pool", "-", "worktree-gitdir-mismatch", json.dumps({"path": str(path), "reason": why}))
+        send(con, "director", "worktree gitdir mismatch: " + os.path.basename(str(path)),
+             f"factory clean left {path} alone: it is not a worktree of its project ({why}). No git call ran in it and nothing "
+             "was removed. Find out who changed its .git file or replaced the directory with a link.", "report", sender="factory")
+        con.execute("INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(time.time())))
+    except (sqlite3.Error, ValueError, OSError):  # the clean must go on
+        pass
+
+
+def _clean_pool_ref(repo, wt, base):
+    """origin/<base> when the repo has that remote ref, else <base> (as prepare_worktree does)."""
+    rc, _, _ = _wt_git(repo, wt, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{base}")
+    return f"origin/{base}" if rc == 0 else base
+
+
+def _clean_pool_poolable(repo, wt):
+    """Why `wt` cannot be pooled (locked, .gitmodules at HEAD), else None. Read-only."""
+    rc, out, err = _git_rc(["worktree", "list", "--porcelain"], repo=repo)
+    if rc != 0:
+        return f"worktree list failed: {err[:60]}"
+    for e in (x.splitlines() for x in out.split("\n\n") if x.strip()):
+        if e[0] == f"worktree {wt}" and any(l == "locked" or l.startswith("locked ") for l in e):
+            return "locked"
+    rc, _, _ = _wt_git(repo, wt, "cat-file", "-e", "HEAD:.gitmodules")
+    if rc == 0:
+        return "has .gitmodules"
+    return None
+
+
+def _clean_pool_release(con, repo, base, t, wt, project_id, cap, has_branch, dry_run, virtual):
+    """Flag on: pool the merged, clean linked worktree `wt` of task `t` instead of removing it. Returns (action, reason),
+    or None to fall through to today's removal (clone, cap reached, locked, .gitmodules, detach failed)."""
+    gitp = wt / ".git"
+    if not gitp.is_file() or gitp.is_symlink():
+        return None  # a per-task clone (D5) or anything odd: today's path
+    if cap <= 0 or pool_free_count(con, project_id) + virtual.get(project_id, 0) >= cap:
+        return None
+    admin, why = worktree_owns_gitdir(repo, wt)
+    if admin is None:
+        _clean_pool_alert(con, wt, why, dry_run)
+        return "skip", "kept: gitdir mismatch"
+    if _clean_pool_poolable(repo, wt):
+        return None
+    if dry_run:
+        virtual[project_id] = virtual.get(project_id, 0) + 1
+        return "would pool", "released to pool"
+    rc, _, _ = _wt_git(repo, wt, "checkout", "-q", "--detach", _clean_pool_ref(repo, wt, base))
+    if rc != 0:
+        return None
+    if has_branch:
+        r = _git(repo, "branch", "-D", t["branch"])
+        if r.returncode != 0:
+            return "skip", "branch delete failed: " + r.stderr.strip()[:80]
+    con.execute("UPDATE tasks SET worktree=NULL WHERE id=?", (t["id"],))
+    pool_free(con, str(wt), project_id)
+    event(con, "task", t["id"], "worktree-pooled", {"path": str(wt), "task": t["id"], "project": project_id})
+    return "pooled", "released to pool"
+
+
+def _clean_pool_dir_problem(repo, wt, base):
+    """Why the unowned-by-a-task dir `wt` is not safe to hand back to the pool (dirty, untracked, unpushed), else None."""
+    rc, out, _ = _wt_git(repo, wt, "status", "--porcelain", "--untracked-files=no")
+    if rc != 0 or out.strip():
+        return "dirty"
+    rc, out, _ = _wt_git(repo, wt, "ls-files", "--others", "--exclude-standard")
+    stray = [f for f in out.splitlines() if "__pycache__" not in Path(f).parts]
+    if rc != 0 or stray:
+        return "untracked files: " + ", ".join(stray[:5])
+    rc, head, _ = _wt_git(repo, wt, "rev-parse", "HEAD")
+    if rc != 0:
+        return "unpushed commits"
+    if _wt_git(repo, wt, "merge-base", "--is-ancestor", head, _clean_pool_ref(repo, wt, base))[0] != 0:
+        return "unpushed commits"
+    return None
+
+
+def _clean_pool_sweep(con, rows, repos, panes, pane_cwds, listed, dry_run, reuse_on, pool_max):
+    """Stale claims (D7) then trim of free rows over the cap (D8). Appends rows; real runs change DB, dirs and events."""
+    def project(pid):
+        pr = con.execute("SELECT repo_path, base_branch FROM projects WHERE id=?", (pid,)).fetchone()
+        if not pr or not pr["repo_path"] or not Path(pr["repo_path"]).is_dir():
+            return None, None
+        repo = pr["repo_path"]
+        if repo not in repos:
+            if not git_config_guard(con, repo):
+                return None, None
+            _git(repo, "fetch", "-q", "origin")
+            repos[repo] = pr["base_branch"] or "main"
+        return repo, pr["base_branch"] or "main"
+
+    def new_row(path, task="-"):
+        r = {"task": task, "worktree": str(path), "branch": "", "action": "skip", "reason": ""}
+        rows.append(r)
+        return r
+
+    virtual_free = {}  # dry run: path -> (project, row) of claims that would become free
+    for c in con.execute("SELECT * FROM worktree_pool WHERE state='claimed' ORDER BY path").fetchall():
+        tk = con.execute("SELECT status, worktree FROM tasks WHERE id=?", (c["task_id"],)).fetchone()
+        if tk is not None:
+            if tk["status"] not in ("done", "cancelled"):
+                continue  # an active task owns it
+            if tk["worktree"] and os.path.realpath(tk["worktree"]) == os.path.realpath(c["path"]):
+                continue  # still the task's own worktree: the task loop above decided
+        row = new_row(c["path"], c["task_id"] or "-")
+        if not os.path.lexists(c["path"]):
+            if not dry_run:
+                pool_release_claim(con, c["path"])
+            row["action"] = "would remove" if dry_run else "removed"
+            row["reason"] = "stale claim, dir gone"
+            continue
+        repo, base = project(c["project_id"])
+        if repo is None:
+            row["reason"] = "no project repo"
+            continue
+        wt = Path(c["path"])
+        admin, why = worktree_owns_gitdir(repo, wt)
+        if admin is None:
+            _clean_pool_alert(con, wt, why, dry_run)
+            row["reason"] = "kept: gitdir mismatch"
+            continue
+        why = _clean_pool_dir_problem(repo, wt, base) or protected_by(con, _real(wt), panes, listed)
+        if why:
+            row["reason"] = why
+            continue
+        if dry_run:
+            row["action"], row["reason"] = "would pool", "stale claim released"
+            virtual_free[c["path"]] = (c["project_id"], row)
+            continue
+        rc, _, err = _wt_git(repo, wt, "checkout", "-q", "--detach", _clean_pool_ref(repo, wt, base))
+        if rc != 0:
+            row["reason"] = "detach failed: " + err[:80]
+            continue
+        pool_free(con, c["path"], c["project_id"])
+        event(con, "task", c["task_id"] or "-", "worktree-pooled", {"path": c["path"], "task": c["task_id"], "project": c["project_id"]})
+        row["action"], row["reason"] = "pooled", "stale claim released"
+
+    # trim: per project, free rows over the cap, oldest released_at first
+    cap = pool_max if reuse_on else 0
+    free = {}
+    for f in con.execute("SELECT * FROM worktree_pool WHERE state='free' ORDER BY released_at, path").fetchall():
+        free.setdefault(f["project_id"], []).append(f["path"])
+    for path, (pid, _) in virtual_free.items():
+        free.setdefault(pid, []).append(path)
+    for pid, paths in sorted(free.items()):
+        for path in paths[:max(0, len(paths) - cap)]:
+            if path in virtual_free:  # dry run: a claim that would be freed is trimmed again
+                virtual_free[path][1]["action"], virtual_free[path][1]["reason"] = "would remove", "pool over cap"
+                continue
+            row = new_row(path)
+            repo, base = project(pid)
+            if repo is None:
+                row["reason"] = "no project repo"
+                continue
+            if not os.path.lexists(path):
+                if not dry_run:
+                    pool_release_claim(con, path)
+                row["action"] = "would remove" if dry_run else "removed"
+                row["reason"] = "pool row, dir gone"
+                continue
+            if any(_within(c, _real(path)) for c in pane_cwds):
+                row["reason"] = "pane cwd"
+                continue
+            if dry_run:
+                admin, why = worktree_owns_gitdir(repo, Path(path))
+                if admin is None:
+                    row["reason"] = "kept: gitdir mismatch"
+                else:
+                    row["action"], row["reason"] = "would remove", "pool over cap"
+                continue
+            rc, _, err = _wt_remove(repo, Path(path))
+            if rc == 126:  # _wt_remove refused: not a worktree of this project (symlink, forged .git); nothing was touched
+                _clean_pool_alert(con, path, err, dry_run)
+                row["reason"] = "kept: gitdir mismatch"
+                continue
+            if rc != 0:
+                row["reason"] = "worktree remove failed: " + err[:80]
+                continue
+            pool_release_claim(con, path)
+            event(con, "pool", "-", "worktree-pool-trimmed", {"path": path, "project": pid})
+            row["action"], row["reason"] = "removed", "pool over cap"
+
+
 def cmd_clean(a):
     """Remove worktrees and branches of finished tasks, after safety checks that a squash merge defeats for git itself."""
     w = caller_is_worker()
@@ -12497,7 +12691,11 @@ def cmd_clean(a):
     rows = []
     known = set()
     repos = {}
-    for t in con.execute("SELECT t.*, p.repo_path, p.base_branch FROM tasks t JOIN goals g ON g.id=t.goal_id "
+    reuse_on = cfg(con, "worktree_reuse") == "1"
+    pool_max = int(cfg(con, "worktree_pool_max")) if reuse_on else 0
+    claimed = {r["path"]: r["task_id"] for r in con.execute("SELECT path, task_id FROM worktree_pool WHERE state='claimed'")}
+    virtual = {}  # dry run: project -> worktrees that would be pooled so far
+    for t in con.execute("SELECT t.*, p.repo_path, p.base_branch, g.project_id AS pool_project FROM tasks t JOIN goals g ON g.id=t.goal_id "
                          "LEFT JOIN projects p ON p.id=g.project_id ORDER BY t.id").fetchall():
         if t["worktree"]:
             known.add(Path(t["worktree"]).resolve())
@@ -12519,6 +12717,11 @@ def cmd_clean(a):
         if why:
             row["reason"] = why
             continue
+        if reuse_on and wt is not None:
+            res = _clean_pool_release(con, repo, base, t, wt, t["pool_project"], pool_max, has_branch, a.dry_run, virtual)
+            if res:
+                row["action"], row["reason"] = res
+                continue
         if a.dry_run:
             row["action"], row["reason"] = "would remove", "merged and clean"
             continue
@@ -12537,6 +12740,8 @@ def cmd_clean(a):
             r = _git(repo, "worktree", "remove", "--force", str(wt))
             if r.returncode == 0:
                 gone.append("worktree")
+                if claimed.get(str(wt)) == t["id"]:
+                    pool_release_claim(con, wt)
             else:
                 err = "worktree remove failed: " + r.stderr.strip()[:80]
         if has_branch and err is None:
@@ -12552,19 +12757,23 @@ def cmd_clean(a):
         row["reason"] = f"removed {' + '.join(gone)}; {err}" if err else "merged and clean"
         event(con, "task", t["id"], "cleaned", {"worktree": str(wt) if ("worktree" in gone or "clone" in gone) else None,
                                                 "branch": t["branch"] if "branch" in gone else None})
+    _clean_pool_sweep(con, rows, repos, panes, pane_cwds, listed, a.dry_run, reuse_on, pool_max)
     if not a.dry_run:
         for repo in repos:
             _git(repo, "worktree", "prune")
     sandbox_rows, sandbox_kept = clean_sandbox_dirs(con, pane_cwds, a.dry_run)
     rows += sandbox_rows
     orphans = []
+    known |= {Path(r["path"]).resolve() for r in con.execute("SELECT path FROM worktree_pool")}
     if WORKTREES.is_dir():
         orphans = sorted(d for d in WORKTREES.iterdir() if d.is_dir() and d.resolve() not in known)
     rows += [{"task": "-", "worktree": str(d), "branch": "", "action": "skip", "reason": "orphan (left alone)"} for d in orphans]
     table(rows, ["task", "worktree", "branch", "action", "reason"])
     n = lambda act: sum(1 for r in rows if r["action"] == act and r["reason"] != "orphan (left alone)")
     print(f"total: {n('removed')} removed, {n('would remove')} would remove, "
-          f"{n('skip')} skipped, {len(orphans)} orphan(s), {sandbox_kept} sandbox dir(s) kept" + (" [dry run]" if a.dry_run else ""))
+          f"{n('skip')} skipped, {len(orphans)} orphan(s), {sandbox_kept} sandbox dir(s) kept"
+          + (f", {n('pooled') + n('would pool')} pooled" if n('pooled') + n('would pool') else "")
+          + (" [dry run]" if a.dry_run else ""))
 
 
 REMOTE_BRANCH_RE = re.compile(r"^factory/[A-Za-z0-9._/-]+$")

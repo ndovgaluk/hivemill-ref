@@ -14,6 +14,10 @@ Enable it with `factory config worktree_reuse 1`; disable with `factory config w
 ## Lifecycle
 
 1. **Clean releases.** `factory clean` finds a merged, pushed, clean worktree whose agent is gone. With reuse on it does not delete the directory: it detaches HEAD at `origin/<base>`, deletes the task branch, clears `tasks.worktree` and records a `free` row in `worktree_pool` (action `pooled`). Every safety refusal of clean (dirty, untracked files, unpushed commits, open PR, live agent, live pane) still applies. After pooling, clean trims the free rows of each project to `worktree_pool_max`, oldest release first (action `removed`, reason `pool over cap`). A `claimed` row is never removed or trimmed.
+
+
+Reset also unlinks (never follows) a symlinked `refs/` or `refs/worktree`, `refs/bisect`, `refs/rewritten` in the worktree admin dir before any git call, and its verification fails if one is left. The claim and the `tasks.worktree`/`branch` update happen in one transaction.
+A failed `git branch -D` on release fails closed: clean checks the task branch out again in the directory (it is not left detached), does not pool it, leaves `tasks.worktree` set, and reports action `skip` with reason `branch delete failed: ...` (`branch delete failed, re-attach failed: ...` if the re-attach fails too). The next clean retries the release. The `total:` line of a run that trimmed free rows ends `, <p> pooled, <t> trimmed` (before ` [dry run]`), so a trim-only run is visible; without any trim it is unchanged.
 2. **Spawn claims.** `factory spawn coder` for a task of the same project claims one free row in a single `BEGIN IMMEDIATE` transaction, so two tasks never get the same worktree. It then resets the worktree to `origin/<base>` on the new branch `factory/<task-id>` and re-runs the git config guard on it. The row becomes `claimed` with the task id; `reset_ok` is set after the reset is verified.
 
 ## What reset keeps and removes

@@ -912,7 +912,16 @@ class WorktreeReuseSpawnTests(FactoryTestCase):
         self.assertTrue(checkouts)
         self.assertEqual(calls[checkouts[0]][0], "0", "config.worktree still existed at checkout")
         self.assertTrue(any(c == "1" and "config" in a and "--file" in a for c, a in calls[:checkouts[0]]),
-                        "the guard never read config.worktree before the checkout")
+                        "no git config --file call ran while config.worktree still existed")
+        # the pooled worktree's own config guard (git_config_refusal(P) starts with this rev-parse), not prepare_worktree's repo-level one
+        guards = [i for i, (_, a) in enumerate(calls) if a.startswith(f"-C {P} ") and "rev-parse --git-dir --git-common-dir" in a]
+        sweep = max(i for i, (c, _) in enumerate(calls[:checkouts[0]]) if c == "1")
+        cleans = [i for i, (_, a) in enumerate(calls) if f"--work-tree={P} " in a and " clean " in f" {a} "]
+        self.assertTrue(cleans, "no git clean ran in the pooled worktree")
+        self.assertTrue(any(sweep < i < checkouts[0] for i in guards),
+                        "no config guard on the pooled worktree between the config.worktree sweep and the first checkout -B")
+        self.assertTrue(any(i > cleans[0] for i in guards),
+                        "no config guard on the pooled worktree after git clean")
 
     def test_forbidden_config_worktree_refuses_spawn_and_runs_nothing(self):
         P = self.pooled()

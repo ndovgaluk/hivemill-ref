@@ -544,6 +544,10 @@ class WorktreeOwnershipTests(FactoryTestCase):
         self.assertEqual(self.sibling_state(), self.sibling_before)
 
     def refuse(self, wt):
+        """Every refusal: rc 126 from _wt_git and _wt_remove AND no git call with cwd under wt or naming wt
+        (only `worktree list --porcelain` run in the repo is allowed)."""
+        self.shim_git()
+        start = len(self.calls())
         admin, why = self.mod.worktree_owns_gitdir(self.repo, wt)
         self.assertIsNone(admin, why)
         self.assertTrue(why)
@@ -551,8 +555,18 @@ class WorktreeOwnershipTests(FactoryTestCase):
         self.assertEqual(rc, 126, err)
         rc, _, err = self.mod._wt_remove(self.repo, wt)
         self.assertEqual(rc, 126, err)
+        self.assert_no_git_call_on(wt, self.calls()[start:])
         self.assert_sibling_intact()
         return why
+
+    def assert_no_git_call_on(self, wt, lines):
+        w = str(wt)
+        for line in lines:
+            cwd, argv = line.split("\t", 1)
+            self.assertFalse(cwd == w or cwd.startswith(w + os.sep), line)
+            self.assertNotIn(w, argv, line)
+            if cwd == str(self.repo):
+                self.assertIn("worktree list --porcelain", argv, line)
 
     def admin(self, name="A"):
         return self.common / "worktrees" / name
@@ -658,6 +672,8 @@ class WorktreeOwnershipTests(FactoryTestCase):
 
     # -- the choke point --------------------------------------------------
     def shim_git(self):
+        if getattr(self, "log", None):
+            return
         real = shutil.which("git")
         shim_dir = self.env.home / "shim"
         shim_dir.mkdir()
@@ -688,13 +704,10 @@ class WorktreeOwnershipTests(FactoryTestCase):
         (self.admin("H") / "commondir").write_text("../..\n")
         self.shim_git()
         for wt in (self.wts / "L", c, x, h):
+            start = len(self.calls())
             self.mod._wt_git(self.repo, wt, "status")
             self.mod._wt_remove(self.repo, wt)
-        for line in self.calls():
-            cwd, argv = line.split("\t", 1)
-            for wt in (self.wts / "L", c, x, h):
-                self.assertFalse(cwd.startswith(str(wt)), line)
-                self.assertNotIn(str(wt), argv, line)
+            self.assert_no_git_call_on(wt, self.calls()[start:])
         self.assert_sibling_intact()
 
     def test_accept_passes_explicit_git_dir_and_work_tree(self):

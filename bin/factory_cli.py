@@ -9026,7 +9026,7 @@ def worktree_owns_gitdir(repo, wt):
 
 def _wt_git(repo, wt, *args, timeout=60, env=None):
     """git on a pooled/released worktree, only after worktree_owns_gitdir passes, always with explicit
-    --git-dir/--work-tree and cwd=<wt> so a planted .git or discovery can redirect nothing. (rc, stdout, stderr);
+    --git-dir/--work-tree (git_argv adds -C <repo>; cwd is <wt>) so a planted .git or discovery can redirect nothing. (rc, stdout, stderr);
     a refusal is rc 126 and no git runs. Never falls back to a plain git call."""
     admin, why = worktree_owns_gitdir(repo, wt)
     if admin is None:

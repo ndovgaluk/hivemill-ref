@@ -1376,19 +1376,19 @@ class WorktreePoolChokePointLintTests(unittest.TestCase):
                                     "def _pool_reset(con, repo, wt, branch, start):\n    _git(wt, \"status\")\n", 1)
         self.assertNotEqual(src, self.source())
         msgs = self.problems(src)
-        self.assertTrue(any("_pool_reset" in m and "_git" in m for m in msgs), msgs)
+        self.assertTrue(any("_pool_reset" in m and "forbidden call _git " in m for m in msgs), msgs)
         head = "def _clean_pool_release(con, repo, base, t, wt, project_id, cap, has_branch, dry_run, virtual):\n"
         src = self.source().replace(head, head + "    _git_out(wt, \"status\")\n", 1)
         self.assertNotEqual(src, self.source())
         msgs = self.problems(src)
-        self.assertTrue(any("_clean_pool_release" in m and "_git_out" in m for m in msgs), msgs)
+        self.assertTrue(any("_clean_pool_release" in m and "forbidden call _git_out " in m for m in msgs), msgs)
 
     def test_second_pinned_git_call_is_caught(self):
         head = "def _clean_pool_release(con, repo, base, t, wt, project_id, cap, has_branch, dry_run, virtual):\n"
         src = self.source().replace(head, head + "    _git(repo, \"status\")\n", 1)
         self.assertNotEqual(src, self.source())
         msgs = self.problems(src)
-        self.assertTrue(any("_clean_pool_release" in m and "_git" in m and "expected 1" in m for m in msgs), msgs)
+        self.assertTrue(any("_clean_pool_release" in m and "allowlisted _git expected 1" in m for m in msgs), msgs)
 
     def test_renamed_required_function_is_caught(self):
         msgs = self.problems(self.source().replace("_pool_reset", "_reset_pooled"))

@@ -1235,24 +1235,34 @@ class WorktreeReuseSpawnTests(FactoryTestCase):
 
 
 class WorktreePoolChokePointLintTests(unittest.TestCase):
-    """D9 static lint: pool/clean-pool code touches a pooled worktree only through _wt_git/_wt_remove."""
+    """D9 static lint: pool/clean-pool code touches a pooled worktree only through _wt_git/_wt_remove.
+
+    The lint is purely syntactic: it checks direct calls inside each scoped top-level def (nested defs and
+    lambdas included). It does not follow calls into other functions.
+    """
 
     SCOPE_RE = re.compile(r"^(_?pool_|_pool_|_clean_pool_)")
     REQUIRED = {"_pool_reset", "_pool_sweep", "_clean_pool_release", "_clean_pool_sweep"}
     HELPERS = ("worktree_owns_gitdir", "_wt_git", "_wt_remove")
-    FORBIDDEN_NAMES = {"os.system", "os.popen", "git_run", "_git_rc", "git_argv", "shutil.rmtree", "shutil.move",
+    FORBIDDEN_NAMES = {"os.system", "os.popen", "git_run", "_git_rc", "git_argv", "_git", "_git_out", "shutil.rmtree", "shutil.move",
                        "os.rename", "os.remove", "os.unlink", "os.rmdir"}
     # (function, callee, count, acts on, why). None acts on a worktree dir.
     ALLOW = (
-        ("_pool_unlink_ref_links", "os.unlink", 2, "admin", "unlinks a symlinked/non-dir ref entry in the admin dir (lines 9355, 9359)"),
-        ("_pool_sweep", "shutil.rmtree", 2, "admin", "per-worktree state dir and refs/ dir inside the admin dir (lines 9367, 9378)"),
-        ("_pool_sweep", "os.unlink", 1, "admin", "per-worktree state file inside the admin dir (line 9369)"),
-        ("_clean_pool_poolable", "_git_rc", 1, "repo", "git -C repo worktree list --porcelain (line 12702)"),
+        ("_pool_unlink_ref_links", "os.unlink", 2, "admin", "unlinks a symlinked/non-dir ref entry in the admin dir"),
+        ("_pool_sweep", "shutil.rmtree", 2, "admin", "per-worktree state dir and refs/ dir inside the admin dir"),
+        ("_pool_sweep", "os.unlink", 1, "admin", "per-worktree state file inside the admin dir"),
+        ("_clean_pool_poolable", "_git_rc", 1, "repo", "git -C repo worktree list --porcelain"),
+        ("_clean_pool_release", "_git", 1, "repo", "git -C repo branch -D on the main repo"),
+        ("_clean_pool_sweep", "_git", 1, "repo", "git -C repo fetch in the nested project() helper"),
     )
 
-    @staticmethod
-    def source():
-        return FACTORY_SRC.read_text()
+    @classmethod
+    def setUpClass(cls):
+        cls.SRC = FACTORY_SRC.read_text()
+        cls.TREE = ast.parse(cls.SRC)
+
+    def source(self):
+        return self.SRC
 
     @staticmethod
     def callee(func):
@@ -1266,9 +1276,10 @@ class WorktreePoolChokePointLintTests(unittest.TestCase):
         return None
 
     def top_funcs(self, src):
+        tree = self.TREE if src is self.SRC else ast.parse(src)
         out = {}
         dups = []
-        for n in ast.parse(src).body:
+        for n in tree.body:
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if n.name in out:
                     dups.append(n.name)
@@ -1277,8 +1288,9 @@ class WorktreePoolChokePointLintTests(unittest.TestCase):
 
     def problems(self, src):
         """Every lint violation in `src` (factory_cli.py text) as a message list."""
-        funcs, _ = self.top_funcs(src)
-        tops = [n for n in ast.parse(src).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        tree = self.TREE if src is self.SRC else ast.parse(src)
+        tops = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        funcs = {n.name: n for n in tops}
         msgs = []
         for h in self.HELPERS:
             c = sum(1 for n in tops if n.name == h)
@@ -1358,6 +1370,25 @@ class WorktreePoolChokePointLintTests(unittest.TestCase):
         j = src.index("worktree_owns_gitdir(", i)
         msgs = self.problems(src[:j] + "owns_nothing(" + src[j + len("worktree_owns_gitdir("):])
         self.assertTrue(any("_wt_remove" in m and "does not call" in m for m in msgs), msgs)
+
+    def test_git_wrappers_are_caught(self):
+        src = self.source().replace("def _pool_reset(con, repo, wt, branch, start):\n",
+                                    "def _pool_reset(con, repo, wt, branch, start):\n    _git(wt, \"status\")\n", 1)
+        self.assertNotEqual(src, self.source())
+        msgs = self.problems(src)
+        self.assertTrue(any("_pool_reset" in m and "_git" in m for m in msgs), msgs)
+        head = "def _clean_pool_release(con, repo, base, t, wt, project_id, cap, has_branch, dry_run, virtual):\n"
+        src = self.source().replace(head, head + "    _git_out(wt, \"status\")\n", 1)
+        self.assertNotEqual(src, self.source())
+        msgs = self.problems(src)
+        self.assertTrue(any("_clean_pool_release" in m and "_git_out" in m for m in msgs), msgs)
+
+    def test_second_pinned_git_call_is_caught(self):
+        head = "def _clean_pool_release(con, repo, base, t, wt, project_id, cap, has_branch, dry_run, virtual):\n"
+        src = self.source().replace(head, head + "    _git(repo, \"status\")\n", 1)
+        self.assertNotEqual(src, self.source())
+        msgs = self.problems(src)
+        self.assertTrue(any("_clean_pool_release" in m and "_git" in m and "expected 1" in m for m in msgs), msgs)
 
     def test_renamed_required_function_is_caught(self):
         msgs = self.problems(self.source().replace("_pool_reset", "_reset_pooled"))
